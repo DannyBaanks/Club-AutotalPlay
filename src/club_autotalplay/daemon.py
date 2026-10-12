@@ -9,6 +9,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 
 from . import core
@@ -70,8 +71,13 @@ def run(poll=None):
         log.info("recibi senal %s, saliendo", signum)
         stopping["flag"] = True
 
-    signal.signal(signal.SIGTERM, _stop)
-    signal.signal(signal.SIGINT, _stop)
+    # signal solo funciona en el main thread (si el daemon corre desde el
+    # tray en un thread, lo omitimos; ahi el paro es via proceso).
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, _stop)
+        signal.signal(signal.SIGINT, _stop)
+    else:
+        log.info("daemon en thread (sin handlers de senal); paro via proceso")
 
     while not stopping["flag"]:
         try:

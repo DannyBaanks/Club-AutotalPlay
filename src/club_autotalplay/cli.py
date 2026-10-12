@@ -81,6 +81,20 @@ def _cmd_uninstall(args):
     return install_mod.uninstall()
 
 
+def _cmd_tray(args):
+    """Lanza la app completa: daemon en background + icono de tray."""
+    from . import tray
+    tray.run()
+    return 0
+
+
+def _cmd_gui(args):
+    """Solo la GUI (lector de estado); el daemon debe correr aparte o via tray."""
+    from . import gui
+    gui.run_app()
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="club-autotalplay",
@@ -106,6 +120,16 @@ def main(argv=None):
 
     p_uninst = sub.add_parser("uninstall", help="remueve el servicio, restaura el anterior (M4)")
     p_uninst.set_defaults(func=_cmd_uninstall)
+
+    # --- M2: app de escritorio ---
+    p_tray = sub.add_parser("tray", help="app completa: daemon + icono de tray")
+    p_tray.set_defaults(func=_cmd_tray)
+
+    p_app = sub.add_parser("app", help="alias de 'tray' (lo que lanza el .desktop/AppImage)")
+    p_app.set_defaults(func=_cmd_tray)
+
+    p_gui = sub.add_parser("gui", help="solo la GUI (lector de estado/logs)")
+    p_gui.set_defaults(func=_cmd_gui)
 
     args = ap.parse_args(argv)
     return args.func(args)
