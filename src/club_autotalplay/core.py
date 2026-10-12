@@ -32,7 +32,10 @@ from datetime import datetime
 
 # --- Config ---------------------------------------------------------------
 SSID = "Club_Totalplay_WiFi"
-DEV = "wlo1"
+IS_WINDOWS = sys.platform.startswith("win")
+# DEV: en Linux es la interfaz WiFi (nmcli). En Windows se detecta bajo demanda
+# (netsh), asi que no se fija aqui.
+DEV = "wlo1" if not IS_WINDOWS else None
 # Probe de conectividad: 204 = online, 302 = captive portal.
 PROBE_HOST = "connectivitycheck.gstatic.com"
 PROBE_PATH = "/generate_204"
@@ -49,7 +52,11 @@ TIMEOUT = 8                # timeout por request
 COOLDOWN_SECONDS = 45      # no reintentar el grant mas seguido que esto
 WIFI_RETRY_SECONDS = 120   # no re-botear el WiFi mas seguido que esto
 
-STATE_DIR = os.path.expanduser("~/.local/state/club-autotalplay")
+if IS_WINDOWS:
+    _base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    STATE_DIR = os.path.join(_base, "club-autotalplay")
+else:
+    STATE_DIR = os.path.expanduser("~/.local/state/club-autotalplay")
 LOG_PATH = os.path.join(STATE_DIR, "watchdog.log")
 STATE_PATH = os.path.join(STATE_DIR, "state.json")
 
@@ -179,33 +186,58 @@ def grant_session(params):
         return False
 
 
-def wifi_connected():
+def _run(cmd, timeout=15):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def _windows_wlan_show():
+    """`netsh wlan show interfaces` (una sola llamada reutilizable)."""
     try:
-        out = subprocess.run(
-            ["nmcli", "-t", "-f", "GENERAL.STATE", "dev", "show", DEV],
-            capture_output=True, text=True, timeout=10,
-        ).stdout
+        return _run(["netsh", "wlan", "show", "interfaces"], timeout=15).stdout
+    except Exception:
+        return ""
+
+
+def wifi_connected():
+    if IS_WINDOWS:
+        # El valor del SSID no se traduce (solo las etiquetas), asi que buscar
+        # el SSID en la salida es robusto al idioma de Windows.
+        return SSID in _windows_wlan_show()
+    try:
+        out = _run(["nmcli", "-t", "-f", "GENERAL.STATE", "dev", "show", DEV]).stdout
         return "100" in out  # 100 (connected)
     except Exception:
         return False
 
 
 def current_ssid():
+    if IS_WINDOWS:
+        for line in _windows_wlan_show().splitlines():
+            s = line.strip()
+            # la etiqueta "SSID" es estable en todos los idiomas; la de estado
+            # no ("State"/"Estado"), por eso no se usa para filtrar.
+            if s.startswith("SSID") and "BSSID" not in s:
+                return s.split(":", 1)[-1].strip()
+        return ""
     try:
-        return subprocess.run(
-            ["nmcli", "-t", "-f", "GENERAL.CONNECTION", "dev", "show", DEV],
-            capture_output=True, text=True, timeout=10,
-        ).stdout.split(":", 1)[-1].strip()
+        return _run(["nmcli", "-t", "-f", "GENERAL.CONNECTION", "dev", "show", DEV]).stdout.split(":", 1)[-1].strip()
     except Exception:
         return ""
 
 
 def bring_up_wifi():
+    if IS_WINDOWS:
+        # analogo de `nmcli connection up`: conecta a un perfil WiFi guardado.
+        log.info("levantando WiFi: netsh wlan connect name=%s", SSID)
+        r = _run(["netsh", "wlan", "connect", f"name={SSID}"], timeout=30)
+        msg = (r.stdout + r.stderr).lower()
+        if r.returncode == 0 and ("se conect" in msg or "connected" in msg):
+            log.info("WiFi OK: %s", (r.stdout or r.stderr).strip())
+            return True
+        log.error("netsh fallo rc=%s out=%s err=%s", r.returncode, r.stdout.strip(), r.stderr.strip())
+        return False
     log.info("levantando WiFi: nmcli connection up %s", SSID)
-    r = subprocess.run(
-        ["nmcli", "connection", "up", SSID],
-        capture_output=True, text=True, timeout=45,
-    )
+    r = _run(["nmcli", "connection", "up", SSID], timeout=45)
     if r.returncode == 0:
         log.info("WiFi OK: %s", r.stdout.strip())
         return True
