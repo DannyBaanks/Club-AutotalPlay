@@ -1,0 +1,345 @@
+"""Core del auto-reconnect para la red publica Club_Totalplay_WiFi.
+
+La red otorga sesiones de ~15 min (en la practica se corta ~cada 5 min).
+Cuando expira, el portal redirige todo el trafico HTTP a:
+    https://clubwifi.totalplay.com.mx/ClubMovil/inicio.jsp?...
+El navegador reproduce un video de publicidad y al terminar hace
+    POST /ClubMovil/video-completado  con {ip, mac, nombreAcc, tipo}
+Ese POST es el que otorga la sesion (devuelve 204 No Content).
+
+Este modulo detecta el corte (302 en el probe de conectividad) y hace el
+mismo POST automaticamente, sin browser ni video. Tambien levanta el WiFi
+si NetworkManager lo dejo caido.
+
+Es una libreria: no configura logging al importarse. El CLI/daemon llama a
+`setup_logging()` antes de usarla.
+"""
+from __future__ import annotations
+
+import http.client
+import json
+import logging
+import os
+import socket
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
+
+# --- Config ---------------------------------------------------------------
+SSID = "Club_Totalplay_WiFi"
+DEV = "wlo1"
+# Probe de conectividad: 204 = online, 302 = captive portal.
+PROBE_HOST = "connectivitycheck.gstatic.com"
+PROBE_PATH = "/generate_204"
+PROBE_PORT = 80
+# Endpoint que otorga la sesion.
+GRANT_HOST = "clubwifi.totalplay.com.mx"
+GRANT_PATH = "/ClubMovil/video-completado"
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+)
+POLL_SECONDS = 20          # cada cuantos segundos se chequea
+TIMEOUT = 8                # timeout por request
+COOLDOWN_SECONDS = 45      # no reintentar el grant mas seguido que esto
+WIFI_RETRY_SECONDS = 120   # no re-botear el WiFi mas seguido que esto
+
+STATE_DIR = os.path.expanduser("~/.local/state/club-autotalplay")
+LOG_PATH = os.path.join(STATE_DIR, "watchdog.log")
+STATE_PATH = os.path.join(STATE_DIR, "state.json")
+
+log = logging.getLogger("club_autotalplay")
+
+
+def setup_logging(level=logging.INFO, to_stdout=True):
+    """Configura logging una sola vez (idempotente)."""
+    root = logging.getLogger("club_autotalplay")
+    root.setLevel(level)
+    if root.handlers:
+        return root
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s")
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    from logging.handlers import RotatingFileHandler
+    fh = RotatingFileHandler(LOG_PATH, maxBytes=512_000, backupCount=3)
+    fh.setFormatter(fmt)
+    root.addHandler(fh)
+    if to_stdout:
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(fmt)
+        root.addHandler(sh)
+    return root
+
+
+def now_iso():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def load_state():
+    try:
+        with open(STATE_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    try:
+        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+        tmp = STATE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, STATE_PATH)
+    except Exception as e:
+        log.warning("no pude guardar estado: %s", e)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Fuerza a urllib a NO seguir redirects (queremos ver el 302)."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def probe():
+    """Devuelve (status, location_url). status: online|captive|down."""
+    url = f"http://{PROBE_HOST}:{PROBE_PORT}{PROBE_PATH}"
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        resp = _opener.open(req, timeout=TIMEOUT)
+        code = resp.getcode()
+        resp.read()
+        if code == 204:
+            return "online", None
+        loc = resp.headers.get("Location")
+        return ("captive", loc) if loc else ("down", None)
+    except urllib.error.HTTPError as e:
+        # urllib lanza HTTPError cuando el redirect handler devuelve None
+        loc = e.headers.get("Location")
+        if e.code in (301, 302, 303, 307, 308) and loc:
+            return "captive", loc
+        return "down", None
+    except (socket.timeout, urllib.error.URLError, ConnectionError, OSError) as e:
+        log.debug("probe fallo: %s", e)
+        return "down", None
+
+
+def parse_portal_params(location):
+    """Extrae ip/mac/nombreAcc de la URL de redirect del portal."""
+    if not location:
+        return None
+    try:
+        qs = urllib.parse.urlparse(location).query
+        params = dict(urllib.parse.parse_qsl(qs))
+    except Exception:
+        return None
+    ip = params.get("wlanuserip") or params.get("ip")
+    mac = params.get("wlanparameter") or params.get("mac")
+    acc = params.get("accname") or params.get("nombreAcc") or params.get("wlanacname")
+    if not (ip and mac):
+        log.warning("params incompletos en location: %s", location)
+        return None
+    return {"ip": ip, "mac": mac, "nombreAcc": acc or "", "tipo": "DESKTOP"}
+
+
+def grant_session(params):
+    """POST al endpoint que otorga la sesion. Devuelve True si 2xx."""
+    body = json.dumps(params).encode("utf-8")
+    ctx = ssl.create_default_context()
+    try:
+        conn = http.client.HTTPSConnection(GRANT_HOST, 443, timeout=TIMEOUT, context=ctx)
+        conn.request(
+            "POST",
+            GRANT_PATH,
+            body=body,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": USER_AGENT,
+                "Origin": f"https://{GRANT_HOST}",
+                "Referer": f"https://{GRANT_HOST}/ClubMovil/inicio?type=DESKTOP",
+            },
+        )
+        resp = conn.getresponse()
+        data = resp.read()
+        conn.close()
+        ok = 200 <= resp.status < 300
+        log.info(
+            "grant POST -> HTTP %s %s body=%r params=%s",
+            resp.status, resp.reason, data[:120], params,
+        )
+        return ok
+    except Exception as e:
+        log.error("grant POST fallo: %s", e)
+        return False
+
+
+def wifi_connected():
+    try:
+        out = subprocess.run(
+            ["nmcli", "-t", "-f", "GENERAL.STATE", "dev", "show", DEV],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        return "100" in out  # 100 (connected)
+    except Exception:
+        return False
+
+
+def current_ssid():
+    try:
+        return subprocess.run(
+            ["nmcli", "-t", "-f", "GENERAL.CONNECTION", "dev", "show", DEV],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.split(":", 1)[-1].strip()
+    except Exception:
+        return ""
+
+
+def bring_up_wifi():
+    log.info("levantando WiFi: nmcli connection up %s", SSID)
+    r = subprocess.run(
+        ["nmcli", "connection", "up", SSID],
+        capture_output=True, text=True, timeout=45,
+    )
+    if r.returncode == 0:
+        log.info("WiFi OK: %s", r.stdout.strip())
+        return True
+    log.error("nmcli fallo rc=%s out=%s err=%s", r.returncode, r.stdout.strip(), r.stderr.strip())
+    return False
+
+
+def verify_online(deadline=45):
+    """Repite el probe hasta que sea online o se acabe el tiempo."""
+    t0 = time.time()
+    while time.time() - t0 < deadline:
+        st, _ = probe()
+        if st == "online":
+            return True
+        time.sleep(3)
+    return False
+
+
+def handle_captive(location, state):
+    params = parse_portal_params(location)
+    if not params:
+        log.error("no pude parsear params del portal; location=%s", location)
+        return False
+    log.info("captive portal detectado -> otorgando sesion: %s", params)
+    if not grant_session(params):
+        return False
+    if verify_online(deadline=40):
+        log.info("SESION OTORGADA - internet restaurado")
+        state["last_grant_ok"] = now_iso()
+        return True
+    log.warning("grant aceptado pero el probe sigue sin 204; intento re-botear WiFi")
+    return False
+
+
+def _iso_to_epoch(s):
+    try:
+        return datetime.fromisoformat(s).timestamp()
+    except Exception:
+        return 0.0
+
+
+def cycle(state):
+    """Un ciclo completo del watchdog. Devuelve accion tomada."""
+    st, location = probe()
+    if st == "online":
+        return "online"
+
+    log.warning("probe=%s location=%s", st, location)
+
+    if st == "captive":
+        last = state.get("last_grant_attempt", "")
+        if last and (time.time() - _iso_to_epoch(last)) < COOLDOWN_SECONDS:
+            log.info("cooldown de grant activo (%s); esperando", last)
+            return "cooldown"
+        state["last_grant_attempt"] = now_iso()
+        save_state(state)
+        if handle_captive(location, state):
+            return "granted"
+        # si el grant no basto, caemos al re-botear abajo
+
+    # "down" o grant fallido: quizas el WiFi se cayo. Re-botear con cooldown.
+    if not wifi_connected():
+        log.warning("WiFi no conectado (ssid=%r)", current_ssid())
+    last_bounce = state.get("last_bounce", "")
+    if last_bounce and (time.time() - _iso_to_epoch(last_bounce)) < WIFI_RETRY_SECONDS:
+        log.info("cooldown de bounce WiFi activo (%s)", last_bounce)
+        return "bounce-cooldown"
+    state["last_bounce"] = now_iso()
+    save_state(state)
+    if bring_up_wifi():
+        time.sleep(4)
+        if verify_online(deadline=40):
+            # tras re-botear puede quedar captive: intenta grant una vez mas
+            st2, loc2 = probe()
+            if st2 == "captive":
+                p = parse_portal_params(loc2)
+                if p and grant_session(p) and verify_online(deadline=30):
+                    log.info("SESION OTORGADA tras bounce")
+                    return "granted-after-bounce"
+            log.info("internet restaurado tras bounce de WiFi")
+            return "bounced"
+    return "failed"
+
+
+def print_status():
+    st, loc = probe()
+    print(f"probe      : {st}")
+    print(f"location   : {loc or '-'}")
+    print(f"wifi       : {'conectado' if wifi_connected() else 'DESCONECTADO'} (dev={DEV})")
+    print(f"ssid       : {current_ssid() or '-'}")
+    params = parse_portal_params(loc) if loc else None
+    if params:
+        print(f"portal     : {json.dumps(params)}")
+    s = load_state()
+    for k in ("last_grant_ok", "last_grant_attempt", "last_bounce"):
+        if s.get(k):
+            print(f"{k:14}: {s[k]}")
+
+
+def main(argv=None):
+    """CLI minima del core: --once / --status (para probar M0)."""
+    import argparse
+    ap = argparse.ArgumentParser(
+        prog="club-autotalplay.core",
+        description="Core del auto-reconnect Club_Totalplay_WiFi",
+    )
+    ap.add_argument("--once", action="store_true", help="un solo ciclo y salir")
+    ap.add_argument("--status", action="store_true", help="imprime estado actual")
+    ap.add_argument("--poll", type=int, default=POLL_SECONDS, help="segundos entre chequeos")
+    args = ap.parse_args(argv)
+
+    setup_logging()
+    if args.status:
+        print_status()
+        return 0
+
+    state = load_state()
+    log.info("core iniciado (poll=%ss, ssid=%s, dev=%s)", args.poll, SSID, DEV)
+    if args.once:
+        action = cycle(state)
+        save_state(state)
+        log.info("ciclo --once: %s", action)
+        return 0
+
+    while True:
+        try:
+            action = cycle(state)
+            save_state(state)
+            if action != "online":
+                log.info("ciclo: %s", action)
+        except Exception as e:
+            log.exception("ciclo exception: %s", e)
+        time.sleep(args.poll)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/*
+!dist/.gitkeep
+.venv/
+venv/
+
+# Empaquetado AppImage (artefactos, no fuente)
+packaging/AppDir/
+*.AppImage
+
+# Estado/log en runtime
+*.log
+*.state.json
+
+# OS
+.DS_Store
