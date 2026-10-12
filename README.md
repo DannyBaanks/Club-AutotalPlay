@@ -39,8 +39,9 @@ Todo en segundo plano, con un **icono en la bandeja** que cambia de color:
 > Probado en Ubuntu 24.04 (GNOME, X11). Se desconecta, el icono se pone rojo,
 > renueva la sesión sola y vuelve a verde.
 
-## Descargar y probar (Linux)
+## Descargar y probar
 
+### Linux (AppImage)
 1. Baja el **AppImage** de [Releases](../../releases) (`Club-AutotalPlay-x86_64.AppImage`).
 2. Hazlo ejecutable y lánzalo:
    ```bash
@@ -55,6 +56,17 @@ Todo en segundo plano, con un **icono en la bandeja** que cambia de color:
 
 > **Nota AppImage:** si tu distro no monta AppImages, instala FUSE:
 > `sudo apt install libfuse2t64` (Debian/Ubuntu) o `sudo dnf install fuse-libs` (Fedora).
+
+### Windows (.exe)
+1. Baja `Club-AutotalPlay.exe` de [Releases](../../releases).
+2. Ábrelo desde una terminal (consola; **aún sin icono de bandeja**):
+   ```bat
+   Club-AutotalPlay.exe status        :: estado (lee/red)
+   Club-AutotalPlay.exe once          :: un ciclo de reconexión
+   Club-AutotalPlay.exe run           :: daemon (auto-reconnect en background)
+   ```
+   Renueva la sesión del portal sola. El icono de bandeja en Windows es trabajo
+   futuro; por ahora es CLI + daemon.
 
 ## Uso
 
@@ -98,9 +110,10 @@ pip install -e '.[gui]'                 # gui = pystray + Pillow + python-xlib
 
 ## Requisitos
 
-- Linux con **NetworkManager** (`nmcli`) — el core depende de él.
-- Python ≥ 3.9 (el core es solo stdlib; la app de escritorio usa `pystray`+`Pillow`).
-- GNOME/X11 para el icono de bandeja (en Wayland puede requerir la extensión AppIndicator).
+- **Linux:** NetworkManager (`nmcli`). El core depende de él.
+- **Windows:** nada extra (usa `netsh`); el `.exe` es standalone.
+- Python ≥ 3.9 (el core es solo stdlib; la app de escritorio Linux usa `pystray`+`Pillow`).
+- GNOME/X11 para el icono de bandeja Linux (en Wayland puede requerir la extensión AppIndicator).
 
 ## Cómo funciona el portal (detalles)
 
