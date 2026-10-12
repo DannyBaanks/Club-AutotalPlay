@@ -1,0 +1,52 @@
+name: Windows .exe
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # para subir el .exe a un Release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar paquete + pyinstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pyinstaller
+
+      - name: Smoke test CLI (antes de empaquetar)
+        run: python -m club_autotalplay.cli --help
+
+      - name: Build .exe (onefile, consola)
+        run: >
+          pyinstaller --noconfirm --clean --onefile
+          --name Club-AutotalPlay
+          packaging/console_entry.py
+
+      - name: Smoke test .exe
+        run: dist\Club-AutotalPlay.exe --help
+
+      - name: Subir a Release (si hay tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.ref_name }}" `
+            dist/Club-AutotalPlay.exe `
+            --clobber
+
+      - name: Guardar artifact (siempre)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Club-AutotalPlay-windows-x64
+          path: dist/Club-AutotalPlay.exe
