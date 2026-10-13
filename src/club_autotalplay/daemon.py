@@ -71,7 +71,7 @@ def run(poll=None):
     state["pid"] = os.getpid()
     core.save_state(state)
     log.info("daemon iniciado (poll=%ss, ssid=%s, dev=%s, pid=%s)",
-             poll, core.SSID, core.DEV, os.getpid())
+             poll, core.SSID, core.wifi_device() or "-", os.getpid())
 
     stopping = {"flag": False}
 

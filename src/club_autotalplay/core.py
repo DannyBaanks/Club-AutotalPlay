@@ -33,9 +33,9 @@ from datetime import datetime
 # --- Config ---------------------------------------------------------------
 SSID = "Club_Totalplay_WiFi"
 IS_WINDOWS = sys.platform.startswith("win")
-# DEV: en Linux es la interfaz WiFi (nmcli). En Windows se detecta bajo demanda
-# (netsh), asi que no se fija aqui.
-DEV = "wlo1" if not IS_WINDOWS else None
+# DEV: en Linux se detecta bajo demanda (nmcli); en Windows tambien (netsh).
+# No se fija aqui: en otra maquina la interfaz puede no ser wlo1.
+DEV = None
 # Probe de conectividad: 204 = online, 302 = captive portal.
 PROBE_HOST = "connectivitycheck.gstatic.com"
 PROBE_PATH = "/generate_204"
@@ -152,9 +152,26 @@ def parse_portal_params(location):
     mac = params.get("wlanparameter") or params.get("mac")
     acc = params.get("accname") or params.get("nombreAcc") or params.get("wlanacname")
     if not (ip and mac):
-        log.warning("params incompletos en location: %s", location)
+        log.warning("params incompletos en location: %s", _redact_location(location))
         return None
     return {"ip": ip, "mac": mac, "nombreAcc": acc or "", "tipo": "DESKTOP"}
+
+
+def _redact_location(location):
+    """Location del portal con ip/mac de la query enmascarados."""
+    if not location:
+        return location
+    try:
+        parts = urllib.parse.urlparse(location)
+        qs = dict(urllib.parse.parse_qsl(parts.query))
+        if qs.get("wlanuserip"):
+            qs["wlanuserip"] = _redact_ip(qs["wlanuserip"])
+        if qs.get("wlanparameter"):
+            qs["wlanparameter"] = _redact_mac(qs["wlanparameter"])
+        new_q = urllib.parse.urlencode(qs)
+        return urllib.parse.urlunparse(parts._replace(query=new_q))
+    except Exception:
+        return "<location no parseable>"
 
 
 def grant_session(params):
@@ -180,7 +197,7 @@ def grant_session(params):
         ok = 200 <= resp.status < 300
         log.info(
             "grant POST -> HTTP %s %s body=%r params=%s",
-            resp.status, resp.reason, data[:120], params,
+            resp.status, resp.reason, data[:120], _redact_params(params),
         )
         return ok
     except Exception as e:
@@ -202,6 +219,84 @@ def _run(cmd, timeout=15):
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kwargs)
 
 
+def _redact_ip(ip):
+    """Enmascara el ultimo octeto de una IPv4 (10.149.222.54 -> 10.149.222.x)."""
+    if not ip:
+        return ip
+    parts = ip.split(".")
+    if len(parts) == 4:
+        parts[-1] = "x"
+        return ".".join(parts)
+    return ip
+
+
+def _redact_mac(mac):
+    """Conserva los primeros 3 octetos del MAC (suficiente para vendor)."""
+    if not mac:
+        return mac
+    sep = "-" if "-" in mac else ":"
+    parts = mac.replace(":", "-").split("-")
+    if len(parts) >= 3:
+        return sep.join(parts[:3] + ["xx"] * (len(parts) - 3))
+    return mac
+
+
+def _redact_params(params):
+    """Copia de params con IP/MAC enmascarada para logs."""
+    if not params:
+        return params
+    out = dict(params)
+    if out.get("ip"):
+        out["ip"] = _redact_ip(out["ip"])
+    if out.get("mac"):
+        out["mac"] = _redact_mac(out["mac"])
+    return out
+
+
+def wifi_device():
+    """Interfaz WiFi activa. Linux: la que este conectada a una red (o la
+    primera wifi si ninguna). Windows: None (netsh no necesita interfaz)."""
+    global DEV
+    if IS_WINDOWS:
+        return None
+    if DEV:
+        return DEV
+    try:
+        out = _run(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device", "status"]).stdout
+        wifi_devs = []
+        for line in out.splitlines():
+            parts = line.split(":")
+            if len(parts) >= 3 and parts[1].strip() == "wifi":
+                dev, state = parts[0].strip(), parts[2].strip()
+                wifi_devs.append((dev, state))
+                if state == "connected":
+                    DEV = dev
+                    log.debug("interfaz WiFi detectada: %s", dev)
+                    return DEV
+        if wifi_devs:
+            DEV = wifi_devs[0][0]
+            log.debug("interfaz WiFi (no conectada): %s", DEV)
+            return DEV
+    except Exception as e:
+        log.debug("no pude detectar interfaz WiFi: %s", e)
+    return None
+
+
+def _connected_to_other_ssid():
+    """True si hay un WiFi conectado a una red que NO es la nuestra.
+
+    En ese caso NO se debe tocar el radio ni hacer `connection up`: matariamos
+    la conexion que el usuario esta usando (oficina, casa, etc.).
+    """
+    if IS_WINDOWS:
+        # netsh wlan connect a nuestra red desconecta la actual; solo lo hace
+        # el usuario via CLI explicito, no el daemon automaticamente.
+        cur = current_ssid()
+        return bool(cur) and cur != SSID
+    cur = current_ssid()
+    return bool(cur) and cur != SSID
+
+
 def _windows_wlan_show():
     """`netsh wlan show interfaces` (una sola llamada reutilizable)."""
     try:
@@ -215,8 +310,11 @@ def wifi_connected():
         # El valor del SSID no se traduce (solo las etiquetas), asi que buscar
         # el SSID en la salida es robusto al idioma de Windows.
         return SSID in _windows_wlan_show()
+    dev = wifi_device()
+    if not dev:
+        return False
     try:
-        out = _run(["nmcli", "-t", "-f", "GENERAL.STATE", "dev", "show", DEV]).stdout
+        out = _run(["nmcli", "-t", "-f", "GENERAL.STATE", "dev", "show", dev]).stdout
         return "100" in out  # 100 (connected)
     except Exception:
         return False
@@ -231,13 +329,26 @@ def current_ssid():
             if s.startswith("SSID") and "BSSID" not in s:
                 return s.split(":", 1)[-1].strip()
         return ""
+    dev = wifi_device()
+    if not dev:
+        return ""
     try:
-        return _run(["nmcli", "-t", "-f", "GENERAL.CONNECTION", "dev", "show", DEV]).stdout.split(":", 1)[-1].strip()
+        return _run(["nmcli", "-t", "-f", "GENERAL.CONNECTION", "dev", "show", dev]).stdout.split(":", 1)[-1].strip()
     except Exception:
         return ""
 
 
 def bring_up_wifi():
+    # Guard: si hay un WiFi conectado a OTRA red, no tocamos nada.
+    # Apagar el radio o forzar `connection up` mataria la conexion que el
+    # usuario esta usando (oficina, casa, etc.).
+    if _connected_to_other_ssid():
+        cur = current_ssid()
+        log.warning(
+            "WiFi conectado a otra red (%r != %r); NO toco el radio ni el perfil",
+            cur, SSID,
+        )
+        return False
     if IS_WINDOWS:
         # analogo de `nmcli connection up`: conecta a un perfil WiFi guardado.
         log.info("levantando WiFi: netsh wlan connect name=%s", SSID)
@@ -290,9 +401,9 @@ def handle_captive(location, state):
     maybe_autocapture("handle_captive")
     params = parse_portal_params(location)
     if not params:
-        log.error("no pude parsear params del portal; location=%s", location)
+        log.error("no pude parsear params del portal; location=%s", _redact_location(location))
         return False
-    log.info("captive portal detectado -> otorgando sesion: %s", params)
+    log.info("captive portal detectado -> otorgando sesion: %s", _redact_params(params))
     if not grant_session(params):
         return False
     if verify_online(deadline=40):
@@ -336,7 +447,7 @@ def cycle(state):
     escalate = streak >= FAIL_STREAK_ESCALATE
     log.warning(
         "probe=%s location=%s fail_streak=%d%s",
-        st, location, streak, " ESCALANDO (reinicio total)" if escalate else "",
+        st, _redact_location(location), streak, " ESCALANDO (reinicio total)" if escalate else "",
     )
 
     if st == "captive":
@@ -381,7 +492,7 @@ def print_status():
     st, loc = probe()
     print(f"probe      : {st}")
     print(f"location   : {loc or '-'}")
-    print(f"wifi       : {'conectado' if wifi_connected() else 'DESCONECTADO'} (dev={DEV})")
+    print(f"wifi       : {'conectado' if wifi_connected() else 'DESCONECTADO'} (dev={wifi_device() or '-'})")
     print(f"ssid       : {current_ssid() or '-'}")
     params = parse_portal_params(loc) if loc else None
     if params:
@@ -392,7 +503,7 @@ def print_status():
             print(f"{k:14}: {s[k]}")
 
 
-def debug_dump(perform_grant=True):
+def debug_dump(perform_grant=True, redact=False):
     """Diagnostico crudo para capturar un corte real (sobre todo Windows).
 
     Duerme cero y no aplica cooldowns: imprime el estado de cada paso tal
@@ -402,6 +513,9 @@ def debug_dump(perform_grant=True):
       B) el portal exige un GET previo (priming/cookie)   -> portalGET_*
       C) el User-Agent cambia el flujo                    -> grant_*
     Devuelve el texto; el CLI decide donde imprimirlo.
+
+    redact=True enmascara IP/MAC en params y body (para autocaptura al log);
+    el `debug` explicito del usuario puede usar redact=False.
     """
     out = []
 
@@ -432,16 +546,20 @@ def debug_dump(perform_grant=True):
         loc = resp.headers.get("Location")
         body = resp.read()[:200]
         p("probe_status", code)
-        p("probe_location", loc or "-")
+        p("probe_location", _redact_location(loc) if redact else (loc or "-"))
         p("probe_body", repr(body))
         for k, v in resp.headers.items():
+            if redact and k.lower() == "location":
+                v = _redact_location(v)
             p(f"probe_hdr {k}", v)
         probe_st = "online" if code == 204 else ("captive" if loc else "down")
     except urllib.error.HTTPError as e:
         loc = e.headers.get("Location")
         p("probe_status", f"HTTPError {e.code}")
-        p("probe_location", loc or "-")
+        p("probe_location", _redact_location(loc) if redact else (loc or "-"))
         for k, v in e.headers.items():
+            if redact and k.lower() == "location":
+                v = _redact_location(v)
             p(f"probe_hdr {k}", v)
         probe_st = "captive" if (e.code in (301, 302, 303, 307, 308) and loc) else "down"
     except Exception as e:
@@ -453,7 +571,7 @@ def debug_dump(perform_grant=True):
     p("current_ssid", current_ssid() or "-")
 
     params = parse_portal_params(loc) if loc else None
-    p("parsed_params", json.dumps(params) if params else "-")
+    p("parsed_params", json.dumps(_redact_params(params) if redact else params) if params else "-")
 
     # --- hipotesis B: GET previo a la pagina del portal ------------------
     if loc and perform_grant:
@@ -464,6 +582,8 @@ def debug_dump(perform_grant=True):
             p("portalGET_status", gr.getcode())
             for k, v in gr.headers.items():
                 if k.lower() in ("location", "set-cookie", "content-type"):
+                    if redact and k.lower() == "location":
+                        v = _redact_location(v)
                     p(f"portalGET_hdr {k}", v)
             p("portalGET_body", repr(gb))
         except Exception as e:
@@ -473,7 +593,7 @@ def debug_dump(perform_grant=True):
     if params and perform_grant:
         body = json.dumps(params).encode("utf-8")
         p("grant_url", f"https://{GRANT_HOST}{GRANT_PATH}")
-        p("grant_body", body.decode("utf-8"))
+        p("grant_body", json.dumps(_redact_params(params)) if redact else body.decode("utf-8"))
         ctx = ssl.create_default_context()
         try:
             conn = http.client.HTTPSConnection(GRANT_HOST, 443, timeout=TIMEOUT, context=ctx)
@@ -510,16 +630,16 @@ _last_capture = {"t": 0.0}
 def maybe_autocapture(tag="captive"):
     """Vuelca debug_dump al log la primera vez que vemos un corte (con cooldown).
 
-    Asi el proximo corte se auto-registra y no hace falta correr `debug` a mano
-    en el segundo exacto. perform_grant=True a proposito: queremos ver el GET
-    al portal y la respuesta cruda del POST (hipotesis B y C).
+    Pasivo por defecto: NO hace GET/POST extra al portal (perform_grant=False)
+    y enmascara IP/MAC (redact=True). El diagnostico activo (grant crudo) queda
+    para el `debug` explicito del usuario, no para el log automatico.
     """
     now = time.time()
     if now - _last_capture["t"] < COOLDOWN_SECONDS:
         return
     _last_capture["t"] = now
     try:
-        log.info("=== AUTOCAPTURA (%s) ===\n%s", tag, debug_dump(perform_grant=True))
+        log.info("=== AUTOCAPTURA (%s) ===\n%s", tag, debug_dump(perform_grant=False, redact=True))
     except Exception as e:
         log.warning("autocaptura fallo: %s", e)
 
@@ -542,7 +662,7 @@ def main(argv=None):
         return 0
 
     state = load_state()
-    log.info("core iniciado (poll=%ss, ssid=%s, dev=%s)", args.poll, SSID, DEV)
+    log.info("core iniciado (poll=%ss, ssid=%s, dev=%s)", args.poll, SSID, wifi_device() or "-")
     if args.once:
         action = cycle(state)
         save_state(state)

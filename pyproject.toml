@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "club-autotalplay"
-version = "0.1.0"
+version = "0.1.1"
 description = "Auto-reconnect para la red publica Club_Totalplay_WiFi (portal cautivo Totalplay)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -25,9 +25,14 @@ dependencies = []
 # 'gui' = app de escritorio: tray (pystray) + icono (Pillow) + backend xorg
 # (python-xlib, para X11; en Wayland haria falta appindicator/ayatana).
 gui = ["pystray>=0.19", "Pillow>=9.0", "python-xlib>=0.31"]
+# 'dev' = tests de regresion (pytest)
+dev = ["pytest>=8.0"]
 
 [project.scripts]
 club-autotalplay = "club_autotalplay.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

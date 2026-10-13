@@ -66,7 +66,7 @@ def _cmd_status(args):
         print(f"fuente       : daemon (state.json, hace {int(age)}s)")
         print(f"online       : {'si' if state.get('online') else 'no'}")
         print(f"probe        : {state.get('probe', '-')}")
-        print(f"wifi         : {'conectado' if state.get('wifi_connected') else 'DESCONECTADO'} (dev={core.DEV})")
+        print(f"wifi         : {'conectado' if state.get('wifi_connected') else 'DESCONECTADO'} (dev={core.wifi_device() or '-'})")
         print(f"ssid         : {state.get('ssid') or '-'}")
         print(f"ultima accion: {state.get('last_action', '-')}")
         print(f"actualizado  : {updated}")
