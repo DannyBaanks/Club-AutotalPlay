@@ -129,6 +129,10 @@ journalctl --user -u club-autotalplay -f     # logs en vivo
 
 El icono de la bandeja tiene menú: **Reconectar ahora**, **Ver estado**, **Salir**.
 
+`status` y `status --live` enmascaran IP, MAC y el identificador de zona del
+portal. El estado local conserva los últimos parámetros necesarios para
+recuperar la sesión y se guarda con permisos privados en Linux.
+
 ## Instalar / desinstalar el servicio
 
 ```bash

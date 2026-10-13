@@ -98,10 +98,18 @@ def load_state():
 
 def save_state(state):
     try:
-        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+        os.makedirs(os.path.dirname(STATE_PATH), mode=0o700, exist_ok=True)
         tmp = STATE_PATH + ".tmp"
-        with open(tmp, "w") as f:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        fd = os.open(tmp, flags, 0o600)
+        if not IS_WINDOWS:
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
+        if not IS_WINDOWS:
+            os.chmod(tmp, 0o600)
         os.replace(tmp, STATE_PATH)
     except Exception as e:
         log.warning("no pude guardar estado: %s", e)
@@ -164,13 +172,22 @@ def _redact_location(location):
     try:
         parts = urllib.parse.urlparse(location)
         qs = dict(urllib.parse.parse_qsl(parts.query))
-        if qs.get("wlanuserip"):
-            qs["wlanuserip"] = _redact_ip(qs["wlanuserip"])
-        if qs.get("wlanparameter"):
-            qs["wlanparameter"] = _redact_mac(qs["wlanparameter"])
+        for key in ("wlanuserip", "ip"):
+            if qs.get(key):
+                qs[key] = _redact_ip(qs[key])
+        for key in ("wlanparameter", "mac"):
+            if qs.get(key):
+                qs[key] = _redact_mac(qs[key])
         for k in qs:
-            if "acc" in k.lower():  # accname/nombreAcc: identificador de zona
+            key = k.lower()
+            if "acc" in key or "acname" in key:
+                # accname/nombreAcc/wlanacname identify the zone or AP.
                 qs[k] = "<ACC>"
+            elif any(
+                secret in key
+                for secret in ("token", "auth", "session", "cookie", "password", "secret", "key")
+            ):
+                qs[k] = "<REDACTADO>"
         new_q = urllib.parse.urlencode(qs)
         return urllib.parse.urlunparse(parts._replace(query=new_q))
     except Exception:
@@ -310,30 +327,36 @@ def _connected_to_other_ssid():
     """True si hay un WiFi conectado a una red que NO es la nuestra.
 
     En ese caso NO se debe tocar el radio ni hacer `connection up`: matariamos
-    la conexion que el usuario esta usando (oficina, casa, etc.).
+    la conexion que el usuario esta usando (oficina, casa, etc.). Un SSID
+    imposible de consultar tambien bloquea la recuperacion automatica: no
+    asumimos que una red desconocida sea segura para desconectar.
     """
-    if IS_WINDOWS:
-        # netsh wlan connect a nuestra red desconecta la actual; solo lo hace
-        # el usuario via CLI explicito, no el daemon automaticamente.
-        cur = current_ssid()
-        return bool(cur) and cur != SSID
     cur = current_ssid()
+    if cur is None:
+        log.warning("SSID desconocido; por seguridad no toco el radio ni el perfil")
+        return True
     return bool(cur) and cur != SSID
 
 
 def _windows_wlan_show():
     """`netsh wlan show interfaces` (una sola llamada reutilizable)."""
     try:
-        return _run(["netsh", "wlan", "show", "interfaces"], timeout=15).stdout
-    except Exception:
-        return ""
+        r = _run(["netsh", "wlan", "show", "interfaces"], timeout=15)
+        if r.returncode != 0:
+            log.debug("netsh wlan show interfaces fallo rc=%s", r.returncode)
+            return None
+        return r.stdout
+    except Exception as e:
+        log.debug("no pude consultar interfaces WiFi: %s", e)
+        return None
 
 
 def wifi_connected():
     if IS_WINDOWS:
         # El valor del SSID no se traduce (solo las etiquetas), asi que buscar
         # el SSID en la salida es robusto al idioma de Windows.
-        return SSID in _windows_wlan_show()
+        out = _windows_wlan_show()
+        return bool(out is not None and SSID in out)
     dev = wifi_device()
     if not dev:
         return False
@@ -344,15 +367,31 @@ def wifi_connected():
         return False
 
 
+def _wifi_radio_is_disabled():
+    """True solo cuando NetworkManager confirma que el radio esta apagado."""
+    try:
+        r = _run(["nmcli", "radio", "wifi"])
+        return r.returncode == 0 and (r.stdout or "").strip().lower() == "disabled"
+    except Exception:
+        return False
+
+
 def current_ssid():
     """SSID REAL de la red WiFi conectada (no el nombre del perfil de NM).
 
     GENERAL.CONNECTION devuelve el nombre del *perfil* de NetworkManager,
     que el usuario pudo haber renombrado ("Mi Club" != SSID real). El SSID
     verdadero vive en la propiedad 802-11-wireless.ssid del perfil.
+
+    Devuelve ``""`` cuando nmcli/netsh confirma que no hay una red asociada,
+    y ``None`` cuando no fue posible averiguarlo. Esa diferencia permite que
+    la recuperacion automatica falle cerrada ante un estado desconocido.
     """
     if IS_WINDOWS:
-        for line in _windows_wlan_show().splitlines():
+        out = _windows_wlan_show()
+        if out is None or not out.strip():
+            return None
+        for line in out.splitlines():
             s = line.strip()
             # la etiqueta "SSID" es estable en todos los idiomas; la de estado
             # no ("State"/"Estado"), por eso no se usa para filtrar.
@@ -361,24 +400,33 @@ def current_ssid():
         return ""
     dev = wifi_device()
     if not dev:
-        return ""
+        # Algunas versiones/estados de NetworkManager ocultan la interfaz
+        # mientras el radio esta apagado. Eso confirma que no hay otra red.
+        return "" if _wifi_radio_is_disabled() else None
     try:
-        profile = _run(
+        r = _run(
             ["nmcli", "-t", "-f", "GENERAL.CONNECTION", "dev", "show", dev]
-        ).stdout.split(":", 1)[-1].strip()
+        )
+        if r.returncode != 0:
+            # Con radio desactivado, dev show puede fallar aunque nmcli siga
+            # confirmando que no hay una asociacion Wi-Fi que proteger.
+            return "" if _wifi_radio_is_disabled() else None
+        profile = r.stdout.split(":", 1)[-1].strip()
     except Exception:
-        return ""
-    if not profile or profile == "--":
+        return None
+    if profile == "--":
         return ""  # sin conexion activa
+    if not profile:
+        return "" if _wifi_radio_is_disabled() else None
     # el perfil puede estar renombrado: pedir el SSID que tiene configurado
     try:
         r = _run(["nmcli", "-g", "802-11-wireless.ssid", "connection", "show", profile])
         ssid = r.stdout.strip()
         if r.returncode == 0 and ssid:
             return ssid
+        return None
     except Exception:
-        pass
-    return profile  # fallback: perfil sin renombrar se llama como el SSID
+        return None
 
 
 def bring_up_wifi():
@@ -492,6 +540,13 @@ def cycle(state):
     # de otro portal (grant equivocado) y el bounce mataria su conexion.
     # bring_up_wifi repite el guard como defensa en profundidad.
     cur = current_ssid()
+    if cur is None:
+        state["fail_streak"] = 0
+        log.warning(
+            "probe=%s pero no pude verificar el SSID; omito la recuperacion automatica",
+            st,
+        )
+        return "ssid-unknown"
     if cur and cur != SSID:
         state["fail_streak"] = 0
         log.warning(
@@ -578,12 +633,12 @@ def cycle(state):
 def print_status():
     st, loc = probe()
     print(f"probe      : {st}")
-    print(f"location   : {loc or '-'}")
+    print(f"location   : {_redact_location(loc) if loc else '-'}")
     print(f"wifi       : {'conectado' if wifi_connected() else 'DESCONECTADO'} (dev={wifi_device() or '-'})")
     print(f"ssid       : {current_ssid() or '-'}")
     params = parse_portal_params(loc) if loc else None
     if params:
-        print(f"portal     : {json.dumps(params)}")
+        print(f"portal     : {json.dumps(_redact_params(params))}")
     s = load_state()
     for k in ("last_grant_ok", "last_grant_attempt", "last_bounce"):
         if s.get(k):
@@ -627,10 +682,14 @@ def debug_dump(perform_grant=True, redact=False):
         proxies = urllib.request.getproxies()
     except Exception as e:
         proxies = {"_error": str(e)}
+    if redact:
+        # Proxy URLs can contain usernames/passwords or tokens. The automatic
+        # capture only needs to show which proxy classes are configured.
+        proxies = {k: "<configurado>" for k, v in proxies.items() if v}
     p("urllib.getproxies()", json.dumps(proxies) if proxies else "(vacio)")
     for var in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"):
         if os.environ.get(var):
-            p(f"env {var}", os.environ[var])
+            p(f"env {var}", "<configurado>" if redact else os.environ[var])
     p("USER_AGENT", USER_AGENT)
 
     # --- probe crudo (hipotesis A) --------------------------------------

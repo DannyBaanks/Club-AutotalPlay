@@ -83,6 +83,55 @@ def _is_active(unit):
     return _run(["systemctl", "--user", "is-active", unit]).returncode == 0
 
 
+def _rollback_failed_install(path, previous_unit, new_enabled, new_active,
+                             old_enabled, old_active):
+    """Restore the unit files and service states captured before installation."""
+    failures = []
+
+    def attempt(label, cmd):
+        try:
+            _run(cmd, check=True)
+        except Exception as e:
+            failures.append(f"{label}: {e}")
+
+    attempt(f"detener {NEW_UNIT}", ["systemctl", "--user", "disable", "--now", NEW_UNIT])
+    try:
+        if previous_unit is None:
+            # This installer created the user unit; return to the previous
+            # state where no user-level override existed.
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+        else:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(previous_unit)
+    except Exception as e:
+        failures.append(f"restaurar archivo de {NEW_UNIT}: {e}")
+
+    attempt("recargar systemd", ["systemctl", "--user", "daemon-reload"])
+    for unit, enabled, active in (
+        (NEW_UNIT, new_enabled, new_active),
+        (OLD_UNIT, old_enabled, old_active),
+    ):
+        if not enabled and not active:
+            # The unit was neither enabled nor active before the attempt; no
+            # further restoration command is needed.
+            continue
+        attempt(
+            f"restaurar habilitacion de {unit}",
+            ["systemctl", "--user", "enable" if enabled else "disable", unit],
+        )
+        attempt(
+            f"restaurar actividad de {unit}",
+            ["systemctl", "--user", "start" if active else "stop", unit],
+        )
+
+    for failure in failures:
+        print(f"  ERROR en rollback: {failure}", file=sys.stderr)
+    return not failures
+
+
 # --- Windows: autostart via acceso directo en la carpeta de inicio ---------
 # No hay systemd en Windows. El equivalente user-friendly es un .lnk en
 # `shell:startup`: es visible en Administrador de tareas > Apps de inicio,
@@ -174,49 +223,63 @@ def install():
         return _win_install()
     print(f"== instalando {NEW_UNIT} ==")
 
-    # 1. escribir la unit del core nuevo
+    # Capture the previous user unit and service states so a failed upgrade
+    # can restore both a first install and a re-install.
     os.makedirs(UNIT_DIR, exist_ok=True)
     path = os.path.join(UNIT_DIR, NEW_UNIT)
+    previous_unit = None
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            previous_unit = f.read()
+    new_enabled = _run(["systemctl", "--user", "is-enabled", NEW_UNIT]).returncode == 0
+    new_active = _is_active(NEW_UNIT)
+    old_enabled = _run(["systemctl", "--user", "is-enabled", OLD_UNIT]).returncode == 0
+    old_active = _is_active(OLD_UNIT)
+
+    # 1. write the new unit
     exe, args = _exec_start()
     with open(path, "w") as f:
         f.write(_unit_template())
     print(f"  unit escrita: {path}")
     print(f'  ExecStart   : "{exe}" {args}')
 
-    _run(["systemctl", "--user", "daemon-reload"], check=True)
+    try:
+        _run(["systemctl", "--user", "daemon-reload"], check=True)
 
-    # 2. recordar el estado del viejo watchdog y pararlo SOLO para evitar
-    #    doble-daemon mientras se prueba el nuevo (no se deshabilita todavia)
-    old_enabled = _run(["systemctl", "--user", "is-enabled", OLD_UNIT]).returncode == 0
-    old_active = _is_active(OLD_UNIT)
-    if old_active:
-        _run(["systemctl", "--user", "stop", OLD_UNIT])
+        # 2. parar el watchdog viejo para evitar doble-daemon mientras se
+        # prueba el nuevo; su estado habilitado no cambia hasta verificarlo.
+        if old_active:
+            _run(["systemctl", "--user", "stop", OLD_UNIT], check=True)
 
-    # 3. habilitar + arrancar el nuevo
-    _run(["systemctl", "--user", "enable", "--now", NEW_UNIT], check=True)
-    # dar un momento a systemd para pasar de 'activating' a 'active'
-    import time
-    for _ in range(10):
-        if _is_active(NEW_UNIT):
-            break
-        time.sleep(0.5)
+        # 3. habilitar + arrancar el nuevo. Exceptions and failure to reach
+        # active both go through the same rollback path.
+        _run(["systemctl", "--user", "enable", "--now", NEW_UNIT], check=True)
+        # dar un momento a systemd para pasar de 'activating' a 'active'
+        import time
+        for _ in range(10):
+            if _is_active(NEW_UNIT):
+                break
+            time.sleep(0.5)
+        if not _is_active(NEW_UNIT):
+            raise RuntimeError(f"{NEW_UNIT} no quedo activo")
 
-    # 4. VERIFICAR antes de migrar: si el nuevo no queda activo, rollback
-    #    (el viejo vuelve exactamente a su estado previo) y salir con error.
-    if not _is_active(NEW_UNIT):
-        print("  ERROR: el servicio nuevo no quedo activo; revirtiendo", file=sys.stderr)
-        _run(["systemctl", "--user", "disable", "--now", NEW_UNIT])
+        # 4. Solo despues de verificar el servicio nuevo se deshabilita el
+        # watchdog anterior. Si esto falla, también restauramos lo anterior.
         if old_enabled:
-            _run(["systemctl", "--user", "enable", "--now", OLD_UNIT])
-        elif old_active:
-            _run(["systemctl", "--user", "start", OLD_UNIT])
-        print(f"  {OLD_UNIT}: estado previo restaurado", file=sys.stderr)
+            _run(["systemctl", "--user", "disable", OLD_UNIT], check=True)
+    except Exception as e:
+        print(f"  ERROR: no pude migrar al servicio nuevo ({e}); revirtiendo", file=sys.stderr)
+        if _rollback_failed_install(
+            path, previous_unit, new_enabled, new_active, old_enabled, old_active
+        ):
+            print("  rollback completo; estados previos restaurados", file=sys.stderr)
+        else:
+            print("  rollback incompleto; revisa los errores anteriores", file=sys.stderr)
         print(f"  revisa: journalctl --user -u {NEW_UNIT}", file=sys.stderr)
         return 1
 
-    # 5. verificado OK -> ahora si migrar: deshabilitar el viejo (no borrarlo)
+    # 5. verificado OK -> el viejo queda deshabilitado, no borrado.
     if old_enabled:
-        _run(["systemctl", "--user", "disable", OLD_UNIT])
         print(f"  {OLD_UNIT}: desactivado (respaldo; la unit se conserva)")
 
     print(f"  {NEW_UNIT}: activo y habilitado")

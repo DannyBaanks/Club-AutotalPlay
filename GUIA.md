@@ -68,6 +68,10 @@ Si algo falla, `debug` imprime el estado crudo de cada paso: si el probe ve el
 Además el daemon **se autovuelca esto al log** la primera vez que detecta un
 captive portal, así que basta con esperar un corte y leer el log.
 
+`status` y `status --live` enmascaran IP, MAC y el identificador de zona del
+portal. La autocaptura también oculta los valores de proxy, que pueden llevar
+credenciales en su URL.
+
 ### Archivos (Windows)
 
 | Qué | Dónde |
@@ -157,12 +161,14 @@ POST https://clubwifi.totalplay.com.mx/ClubMovil/video-completado
   en `daemon.lock` que el kernel libera al morir el proceso — funciona igual
   tras un reboot), y todos los ciclos (del daemon y de "Reconectar ahora")
   pasan por un lock de archivo, así que dos recuperaciones nunca compiten.
-- **`debug` sale redactado por defecto** (IP/MAC/accname/cookies ocultos).
-  Usa `debug --full` solo para tu propio análisis y no compartas esa salida
-  sin revisarla.
+- **`debug` sale redactado por defecto** (IP/MAC/accname/cookies y valores de
+  proxy ocultos). Usa `debug --full` solo para tu propio análisis y no
+  compartas esa salida sin revisarla. `status` también redacta los datos del
+  portal.
 - **En otra red (oficina/casa) el daemon no toca nada.** Si el WiFi está
-  conectado a una red que no es `Club_Totalplay_WiFi`, ni grantea el portal
-  ajeno ni re-botea el radio. Vuelve a nuestra red y sigue trabajando.
+  conectado a una red que no es `Club_Totalplay_WiFi`, o no puede verificar a
+  qué red está conectado, ni grantea el portal ajeno ni re-botea el radio.
+  Vuelve a nuestra red y sigue trabajando.
 - **Windows marca "Acción necesaria" en el WiFi.** Eso lo hace el sistema
   operativo, no el portal. Mientras el daemon corra, la sesión se renueva sola
   aunque esa etiqueta aparezca un momento.
