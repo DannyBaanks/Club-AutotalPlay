@@ -50,7 +50,7 @@ USER_AGENT = (
 POLL_SECONDS = 20          # cada cuantos segundos se chequea
 TIMEOUT = 8                # timeout por request
 COOLDOWN_SECONDS = 45      # no reintentar el grant mas seguido que esto
-WIFI_RETRY_SECONDS = 120   # no re-botear el WiFi mas seguido que esto
+WIFI_RETRY_SECONDS = 30    # no re-botear el WiFi mas seguido que esto
 
 if IS_WINDOWS:
     _base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
@@ -236,7 +236,22 @@ def bring_up_wifi():
             return True
         log.error("netsh fallo rc=%s out=%s err=%s", r.returncode, r.stdout.strip(), r.stderr.strip())
         return False
-    log.info("levantando WiFi: nmcli connection up %s", SSID)
+    # Linux: toggle de radio (el MISMO que el toggle manual del usuario).
+    # `nmcli connection up` a veces falla con "Causa desconocida" cuando el AP
+    # no esta en el escaneo; apagar/prender el radio siempre reconecta.
+    log.info("re-boteando WiFi: nmcli radio wifi off/on")
+    _run(["nmcli", "radio", "wifi", "off"])
+    time.sleep(2)
+    _run(["nmcli", "radio", "wifi", "on"])
+    # esperar a que NetworkManager reconecte a la red conocida
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if wifi_connected():
+            log.info("WiFi OK (radio re-botado y reconnectado)")
+            return True
+        time.sleep(2)
+    # fallback por si el radio no basto
+    log.warning("radio toggle no reconectó en 30s; intento connection up")
     r = _run(["nmcli", "connection", "up", SSID], timeout=45)
     if r.returncode == 0:
         log.info("WiFi OK: %s", r.stdout.strip())
@@ -289,14 +304,16 @@ def cycle(state):
 
     if st == "captive":
         last = state.get("last_grant_attempt", "")
-        if last and (time.time() - _iso_to_epoch(last)) < COOLDOWN_SECONDS:
-            log.info("cooldown de grant activo (%s); esperando", last)
-            return "cooldown"
-        state["last_grant_attempt"] = now_iso()
-        save_state(state)
-        if handle_captive(location, state):
-            return "granted"
-        # si el grant no basto, caemos al re-botear abajo
+        can_grant = not (last and (time.time() - _iso_to_epoch(last)) < COOLDOWN_SECONDS)
+        if can_grant:
+            state["last_grant_attempt"] = now_iso()
+            save_state(state)
+            if handle_captive(location, state):
+                return "granted"
+            # grant fallo -> cae al re-botear abajo (no nos quedamos esperando)
+        else:
+            log.info("cooldown de grant activo (%s); sin grant, pruebo bounce", last)
+        # grant no disponible o fallo -> cae al bounce YA (sin return precoz)
 
     # "down" o grant fallido: quizas el WiFi se cayo. Re-botear con cooldown.
     if not wifi_connected():
