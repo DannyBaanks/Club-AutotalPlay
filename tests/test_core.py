@@ -468,12 +468,13 @@ def test_current_ssid_sin_conexion(monkeypatch):
 # exclusión mutua: el lock del ciclo (daemon vs manual)
 # ---------------------------------------------------------------------------
 
-def test_cycle_lock_exclusion_mutua():
+def test_cycle_lock_exclusion_mutua(tmp_path, monkeypatch):
     """Si un ciclo sostiene el lock, otro no entra hasta que se suelte."""
     import threading
     import time as _t
     from club_autotalplay import daemon
 
+    monkeypatch.setattr(core, "STATE_DIR", str(tmp_path))
     got = threading.Event()
     results = {}
 
@@ -501,12 +502,13 @@ def test_cycle_lock_exclusion_mutua():
         pass
 
 
-def test_run_once_ocupado_devuelve_busy(monkeypatch):
+def test_run_once_ocupado_devuelve_busy(tmp_path, monkeypatch):
     """run_once con el lock tomado espera y devuelve 'busy' sin tocar nada."""
     import threading
     import time as _t
     from club_autotalplay import daemon
 
+    monkeypatch.setattr(core, "STATE_DIR", str(tmp_path))
     got = threading.Event()
 
     def holder():
@@ -533,6 +535,45 @@ def test_run_once_ocupado_devuelve_busy(monkeypatch):
     monkeypatch.setattr(daemon, "_refresh_state", lambda s, a: s)
     monkeypatch.setattr(daemon.core, "save_state", lambda s: None)
     assert daemon.run_once() == "online"
+
+
+# ---------------------------------------------------------------------------
+# lock de VIDA del daemon: un solo daemon por maquina, reboot-proof
+# ---------------------------------------------------------------------------
+
+def test_daemon_lock_vida(tmp_path, monkeypatch):
+    """El lock de vida vive mientras el proceso lo retiene; suelto = libre."""
+    from club_autotalplay import daemon
+
+    monkeypatch.setattr(core, "STATE_DIR", str(tmp_path))
+    assert daemon.daemon_alive() is False  # nadie lo tiene
+
+    fh = daemon.acquire_daemon_lock()
+    assert fh is not None
+    assert daemon.daemon_alive() is True   # tomado
+
+    fh2 = daemon.acquire_daemon_lock()
+    assert fh2 is None                     # un segundo daemon NO entra
+
+    fh.close()                             # el proceso "muere"
+    assert daemon.daemon_alive() is False  # el kernel soltó el lock
+
+
+def test_run_sale_limpio_si_otro_daemon_vive(tmp_path, monkeypatch):
+    """daemon.run() con el lock de vida tomado sale 0 sin ciclar."""
+    from club_autotalplay import daemon
+
+    monkeypatch.setattr(core, "STATE_DIR", str(tmp_path))
+    fh = daemon.acquire_daemon_lock()
+    assert fh is not None
+    try:
+        def forbidden():
+            raise AssertionError("run no debe ciclar si otro daemon vive")
+
+        monkeypatch.setattr(daemon, "run_once", forbidden)
+        assert daemon.run(poll=1) == 0
+    finally:
+        fh.close()
 
 
 # ---------------------------------------------------------------------------

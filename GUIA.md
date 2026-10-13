@@ -153,9 +153,10 @@ POST https://clubwifi.totalplay.com.mx/ClubMovil/video-completado
   máquina limpia nunca hubo `clubwifi-watchdog`; ahí simplemente remueve el
   servicio y listo.
 - **No corras el daemon a la vez desde la consola (`run`) y desde la bandeja.**
-  El tray detecta un daemon vivo y no spawnea otro (hay guard), y todos los
-  ciclos (del daemon y de "Reconectar ahora") pasan por un lock de archivo,
-  así que dos recuperaciones nunca compiten.
+  No pasa nada si lo haces: solo **un** daemon vive por máquina (lock de vida
+  en `daemon.lock` que el kernel libera al morir el proceso — funciona igual
+  tras un reboot), y todos los ciclos (del daemon y de "Reconectar ahora")
+  pasan por un lock de archivo, así que dos recuperaciones nunca compiten.
 - **`debug` sale redactado por defecto** (IP/MAC/accname/cookies ocultos).
   Usa `debug --full` solo para tu propio análisis y no compartas esa salida
   sin revisarla.

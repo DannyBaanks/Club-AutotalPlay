@@ -60,27 +60,14 @@ class TrayApp:
     def _daemon_already_running():
         """¿Hay ya un daemon vivo (p.ej. el servicio systemd)?
 
-        Mira el state.json: si es fresco y su pid sigue vivo, otro daemon
-        (servicio) ya esta trabajando — el tray no debe spawnearear otro.
+        Sondea el LOCK DE VIDA del daemon (daemon.lock con flock/msvcrt),
+        no el pid del state.json: tras un reboot el state queda "viejo" por
+        definición y el guard viejo dejaba spawnear un segundo daemon aunque
+        el servicio ya estuviera arrancando (pasó en el boot del 2026-10-13).
+        El kernel libera el lock cuando el proceso muere: no hay ventana de
+        estado estancado.
         """
-        state = core.load_state()
-        pid = state.get("pid")
-        if not pid:
-            return False
-        updated = state.get("updated_at")
-        if updated:
-            try:
-                from datetime import datetime
-                age = (datetime.now().astimezone() - datetime.fromisoformat(updated)).total_seconds()
-            except Exception:
-                age = None
-            if age is None or age > core.POLL_SECONDS * 3:
-                return False  # estado viejo: el pid no sirve
-        # NO usar os.kill(pid, 0) aqui: en Windows eso NO sondea, llama a
-        # TerminateProcess y MATARIA al daemon en vez de preguntar si vive
-        # (verificado: victim murio con rc=0xC000013A). daemon._pid_alive usa
-        # OpenProcess/GetExitCodeProcess en Windows y kill(pid,0) en POSIX.
-        return daemon._pid_alive(pid)
+        return daemon.daemon_alive()
 
     # --- threads -----------------------------------------------------------
     def _daemon_thread(self):
