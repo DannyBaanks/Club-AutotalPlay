@@ -91,6 +91,7 @@ def test_redact_params():
     out = core._redact_params(PORTAL_PARAMS)
     assert out["ip"] == "10.149.222.x"
     assert out["mac"] == "50-2e-91-xx-xx-xx"
+    assert out["nombreAcc"] == "<ACC>"  # identificador de zona/AP
     # el original no se toca
     assert PORTAL_PARAMS["ip"] == "10.149.222.166"
 
@@ -99,7 +100,7 @@ def test_redact_location():
     out = core._redact_location(CAPTIVE_LOC)
     assert "10.149.222.x" in out
     assert "50-2e-91-xx-xx-xx" in out
-    assert "NEZA-TEST" in out  # accname no es sensible
+    assert "NEZA-TEST" not in out  # accname tambien se enmascara
 
 
 def test_redact_mac_solo_tres_octetos():
@@ -131,6 +132,7 @@ def test_ciclo_captive_grant_ok(monkeypatch):
         return ("captive", CAPTIVE_LOC) if calls["probe"] == 1 else ("online", None)
 
     monkeypatch.setattr(core, "probe", fake_probe)
+    monkeypatch.setattr(core, "current_ssid", lambda: core.SSID)
     monkeypatch.setattr(core, "grant_session", lambda p: True)
     monkeypatch.setattr(core, "verify_online", lambda deadline=0: True)
     monkeypatch.setattr(core, "maybe_autocapture", lambda tag="captive": None)
@@ -149,6 +151,7 @@ def test_ciclo_captive_grant_ok(monkeypatch):
 
 def test_ciclo_captive_grant_falla_hace_bounce(monkeypatch):
     monkeypatch.setattr(core, "probe", lambda: ("captive", CAPTIVE_LOC))
+    monkeypatch.setattr(core, "current_ssid", lambda: core.SSID)
     monkeypatch.setattr(core, "grant_session", lambda p: False)
     monkeypatch.setattr(core, "maybe_autocapture", lambda tag="captive": None)
     monkeypatch.setattr(core, "save_state", lambda s: None)
@@ -378,6 +381,158 @@ def test_grant_session_error(monkeypatch):
 
     monkeypatch.setattr(core.http.client, "HTTPSConnection", FakeConn)
     assert core.grant_session(PORTAL_PARAMS) is False
+
+
+# ---------------------------------------------------------------------------
+# guard de red ajena: el ciclo ENTERO se abstiene, no solo bring_up_wifi
+# ---------------------------------------------------------------------------
+
+def test_ciclo_otra_red_no_recupera(monkeypatch):
+    """En otra red: ni grant ni bounce; devuelve other-network y resetea streak."""
+    monkeypatch.setattr(core, "probe", lambda: ("down", None))
+    monkeypatch.setattr(core, "current_ssid", lambda: "WifiOficina")
+
+    def forbidden(*a, **k):
+        raise AssertionError("no debe ejecutarse recuperacion en red ajena")
+
+    monkeypatch.setattr(core, "grant_session", forbidden)
+    monkeypatch.setattr(core, "bring_up_wifi", forbidden)
+    monkeypatch.setattr(core, "wifi_connected", forbidden)
+
+    state = _fresh_state(fail_streak=4)
+    action = core.cycle(state)
+    assert action == "other-network"
+    assert state["fail_streak"] == 0  # estar en otra red no es un fallo nuestro
+
+
+def test_ciclo_captive_otra_red_no_grant(monkeypatch):
+    """Captive de OTRO portal (otra red): no se hace grant con params ajenos."""
+    monkeypatch.setattr(core, "probe", lambda: ("captive", "https://otro-portal.mx/login"))
+    monkeypatch.setattr(core, "current_ssid", lambda: "WifiOficina")
+
+    def forbidden(*a, **k):
+        raise AssertionError("no debe grantear el portal de otra red")
+
+    monkeypatch.setattr(core, "grant_session", forbidden)
+    state = _fresh_state()
+    assert core.cycle(state) == "other-network"
+
+
+# ---------------------------------------------------------------------------
+# current_ssid: SSID REAL (propiedad del perfil), no el nombre del perfil
+# ---------------------------------------------------------------------------
+
+def test_current_ssid_perfil_renombrado(monkeypatch):
+    """GENERAL.CONNECTION da el nombre del perfil; el SSID real vive en
+    802-11-wireless.ssid. Un perfil renombrado no debe confundir al guard."""
+    core.DEV = None
+    calls = []
+
+    def fake_run(cmd, timeout=15):
+        calls.append(cmd)
+        class R:
+            returncode, stderr = 0, ""
+        if "GENERAL.CONNECTION" in cmd:
+            R.stdout = "GENERAL.CONNECTION:Mi Club Renombrado\n"
+        elif "802-11-wireless.ssid" in cmd:
+            R.stdout = core.SSID + "\n"
+        else:
+            R.stdout = "wlo1:wifi:connected\n"
+        return R()
+
+    monkeypatch.setattr(core, "_run", fake_run)
+    monkeypatch.setattr(core, "IS_WINDOWS", False)
+    assert core.current_ssid() == core.SSID
+    core.DEV = None
+
+
+def test_current_ssid_sin_conexion(monkeypatch):
+    core.DEV = None
+
+    def fake_run(cmd, timeout=15):
+        class R:
+            returncode, stderr = 0, ""
+        if "GENERAL.CONNECTION" in cmd:
+            R.stdout = "GENERAL.CONNECTION:--\n"
+        else:
+            R.stdout = "wlo1:wifi:disconnected\n"
+        return R()
+
+    monkeypatch.setattr(core, "_run", fake_run)
+    monkeypatch.setattr(core, "IS_WINDOWS", False)
+    assert core.current_ssid() == ""
+    core.DEV = None
+
+
+# ---------------------------------------------------------------------------
+# exclusión mutua: el lock del ciclo (daemon vs manual)
+# ---------------------------------------------------------------------------
+
+def test_cycle_lock_exclusion_mutua():
+    """Si un ciclo sostiene el lock, otro no entra hasta que se suelte."""
+    import threading
+    import time as _t
+    from club_autotalplay import daemon
+
+    got = threading.Event()
+    results = {}
+
+    def holder():
+        with daemon._cycle_lock():
+            got.set()  # ya tengo el lock
+            _t.sleep(0.6)
+
+    t1 = threading.Thread(target=holder)
+    t1.start()
+    assert got.wait(timeout=2), "el holder no tomo el lock"
+
+    # el segundo intento con timeout corto debe fallar (TimeoutError)
+    try:
+        with daemon._cycle_lock(timeout=0.3):
+            results["second"] = "entro"
+    except TimeoutError:
+        results["second"] = "rechazado"
+
+    t1.join()
+    assert results["second"] == "rechazado"
+
+    # tras soltar, el lock debe estar libre de nuevo
+    with daemon._cycle_lock(timeout=1):
+        pass
+
+
+def test_run_once_ocupado_devuelve_busy(monkeypatch):
+    """run_once con el lock tomado espera y devuelve 'busy' sin tocar nada."""
+    import threading
+    import time as _t
+    from club_autotalplay import daemon
+
+    got = threading.Event()
+
+    def holder():
+        with daemon._cycle_lock():
+            got.set()
+            _t.sleep(0.8)
+
+    t1 = threading.Thread(target=holder)
+    t1.start()
+    assert got.wait(timeout=2)
+    monkeypatch.setattr(daemon, "LOCK_TIMEOUT", 0.4)
+
+    # cycle NO debe llamarse: el lock esta tomado
+    def forbidden(state):
+        raise AssertionError("cycle no debe correr sin el lock")
+
+    monkeypatch.setattr(daemon.core, "cycle", forbidden)
+    action = daemon.run_once()
+    assert action == "busy"
+    t1.join()
+
+    # sanity: con el lock libre, run_once si corre cycle
+    monkeypatch.setattr(daemon.core, "cycle", lambda s: "online")
+    monkeypatch.setattr(daemon, "_refresh_state", lambda s, a: s)
+    monkeypatch.setattr(daemon.core, "save_state", lambda s: None)
+    assert daemon.run_once() == "online"
 
 
 # ---------------------------------------------------------------------------

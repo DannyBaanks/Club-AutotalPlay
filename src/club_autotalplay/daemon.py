@@ -2,9 +2,15 @@
 
 El estado se escribe a `core.STATE_PATH` (JSON) para que la GUI/tray (M2)
 pueda leerlo sin re-probar la red.
+
+Exclusión mutua: cada ciclo (el del loop del daemon Y los manuales de
+"Reconectar ahora" del tray/GUI/`once`) pasa por un lock de archivo
+(`cycle.lock`). Así dos recuperaciones nunca compiten por state.json ni
+por el portal (grant/bounce simultáneos).
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import signal
@@ -28,6 +34,60 @@ STATE_KEYS = (
     "last_grant_attempt",
     "last_bounce",
 )
+
+# Un ciclo con bounce puede tardar ~90s (radio 30s + verify 40s + margen).
+LOCK_TIMEOUT = 120
+
+
+def _cycle_lock_path():
+    return os.path.join(core.STATE_DIR, "cycle.lock")
+
+
+@contextlib.contextmanager
+def _cycle_lock(timeout=LOCK_TIMEOUT):
+    """Lock de archivo cross-platform (flock en POSIX, locking en Windows).
+
+    Serializa los ciclos del daemon contra los manuales del tray/GUI/CLI.
+    Si no se obtiene en `timeout` segundos, lanza TimeoutError.
+    """
+    os.makedirs(core.STATE_DIR, exist_ok=True)
+    fh = open(_cycle_lock_path(), "a+")
+    try:
+        deadline = time.time() + timeout
+        if core.IS_WINDOWS:
+            import msvcrt
+            while True:
+                if time.time() >= deadline:
+                    raise TimeoutError(f"ciclo ocupado (lock {timeout}s)")
+                try:
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.5)
+            try:
+                yield
+            finally:
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            while True:
+                # deadline ANTES de reintentar: si el sleep anterior se paso
+                # del timeout, no volver a competir por el lock
+                if time.time() >= deadline:
+                    raise TimeoutError(f"ciclo ocupado (lock {timeout}s)")
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    time.sleep(0.5)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+    finally:
+        fh.close()
 
 
 # Acciones del ciclo que ya garantizan online verificado (sin re-probar).
@@ -53,13 +113,22 @@ def _refresh_state(state, action):
 
 
 def run_once(state=None):
-    """Un ciclo del daemon: corre core.cycle y publica estado. Devuelve accion."""
+    """Un ciclo del daemon: corre core.cycle y publica estado. Devuelve accion.
+
+    Pasa por _cycle_lock: si otro ciclo corre (daemon o manual), espera
+    hasta LOCK_TIMEOUT; si no lo obtiene devuelve "busy" sin tocar nada.
+    """
     if state is None:
         state = core.load_state()
-    action = core.cycle(state)
-    _refresh_state(state, action)
-    core.save_state(state)
-    return action
+    try:
+        with _cycle_lock(timeout=LOCK_TIMEOUT):
+            action = core.cycle(state)
+            _refresh_state(state, action)
+            core.save_state(state)
+            return action
+    except TimeoutError:
+        log.info("ciclo ocupado (otra recuperacion corriendo); se omite")
+        return "busy"
 
 
 def run(poll=None):

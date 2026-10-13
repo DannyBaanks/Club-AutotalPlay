@@ -1,10 +1,13 @@
 """Instalador/desinstalador del servicio systemd user (M4).
 
-Corte limpio:
-  install   -> escribe `club-autotalplay.service` apuntando al core nuevo,
-               desactiva el watchdog viejo (`clubwifi-watchdog.service`) como
-               respaldo (no lo borra), y arranca el nuevo.
-  uninstall -> detiene/desactiva el nuevo y restaura el viejo (respaldo).
+Corte seguro para maquinas ajenas:
+  install   -> escribe la unit apuntando al ejecutable PERSISTENTE correcto
+               (AppImage/binario/python segun como se lanza), arranca el
+               nuevo servicio, VERIFICA que quede activo, y solo entonces
+               deshabilita el watchdog viejo. Si la verificacion falla,
+               revierte todo al estado previo.
+  uninstall -> detiene/desactiva el nuevo y restaura el viejo SOLO si
+               existia en esta maquina (en instalaciones limpias nunca hubo).
 """
 from __future__ import annotations
 
@@ -31,18 +34,41 @@ def _run(cmd, check=False):
     return r
 
 
+def _unit_exists(unit):
+    """True si la unit existe en systemd (aunque este deshabilitada)."""
+    return _run(["systemctl", "--user", "cat", unit]).returncode == 0
+
+
+def _exec_start():
+    """(exe, args) robustos para ExecStart, incluso corriendo desde AppImage.
+
+    - AppImage: `sys.executable` es el binario empaquetado en el montaje
+      TEMPORAL del AppImage (/tmp/.mount_XXX) — usarlo en ExecStart romperia
+      el servicio en el siguiente arranque. El AppImage mismo es el
+      ejecutable persistente; su ruta llega en la env APPIMAGE.
+    - Binario congelado fuera de AppImage (raro): usarlo directamente.
+    - Desarrollo: python del venv con -m.
+    """
+    appimage = os.environ.get("APPIMAGE")
+    if appimage and os.path.exists(appimage):
+        return appimage, "run"
+    if getattr(sys, "frozen", False):
+        return sys.executable, "run"
+    return sys.executable, "-m club_autotalplay.cli run"
+
+
 def _unit_template():
-    # sys.executable = el python del venv donde esta instalado el paquete.
+    exe, args = _exec_start()
     # systemd parte ExecStart por espacios: si la ruta contiene espacios
-    # (p.ej. "ISyCo Git") hay que comillarla, o truena con status=203/EXEC.
-    exec_start = f'"{sys.executable}" -m club_autotalplay.cli run'
+    # (p.ej. "ISyCo Git" o "Descargas") hay que comillarla, o truena con
+    # status=203/EXEC.
     return f"""[Unit]
-Description=Club-AutotalPlay auto-reconnect (core nuevo)
+Description=Club-AutotalPlay auto-reconnect
 After=network.target NetworkManager.service
 
 [Service]
 Type=simple
-ExecStart={exec_start}
+ExecStart="{exe}" {args}
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
@@ -151,18 +177,20 @@ def install():
     # 1. escribir la unit del core nuevo
     os.makedirs(UNIT_DIR, exist_ok=True)
     path = os.path.join(UNIT_DIR, NEW_UNIT)
+    exe, args = _exec_start()
     with open(path, "w") as f:
         f.write(_unit_template())
     print(f"  unit escrita: {path}")
-    print(f"  ExecStart   : {sys.executable} -m club_autotalplay.cli run")
+    print(f'  ExecStart   : "{exe}" {args}')
 
     _run(["systemctl", "--user", "daemon-reload"], check=True)
 
-    # 2. desactivar el viejo como respaldo (no lo borramos)
-    if _run(["systemctl", "--user", "is-enabled", OLD_UNIT]).returncode == 0:
-        _run(["systemctl", "--user", "disable", OLD_UNIT])
-        print(f"  {OLD_UNIT} desactivado (respaldo; la unit se conserva)")
-    _run(["systemctl", "--user", "stop", OLD_UNIT])
+    # 2. recordar el estado del viejo watchdog y pararlo SOLO para evitar
+    #    doble-daemon mientras se prueba el nuevo (no se deshabilita todavia)
+    old_enabled = _run(["systemctl", "--user", "is-enabled", OLD_UNIT]).returncode == 0
+    old_active = _is_active(OLD_UNIT)
+    if old_active:
+        _run(["systemctl", "--user", "stop", OLD_UNIT])
 
     # 3. habilitar + arrancar el nuevo
     _run(["systemctl", "--user", "enable", "--now", NEW_UNIT], check=True)
@@ -172,13 +200,26 @@ def install():
         if _is_active(NEW_UNIT):
             break
         time.sleep(0.5)
+
+    # 4. VERIFICAR antes de migrar: si el nuevo no queda activo, rollback
+    #    (el viejo vuelve exactamente a su estado previo) y salir con error.
     if not _is_active(NEW_UNIT):
-        print("  ERROR: el servicio nuevo no quedo activo", file=sys.stderr)
+        print("  ERROR: el servicio nuevo no quedo activo; revirtiendo", file=sys.stderr)
+        _run(["systemctl", "--user", "disable", "--now", NEW_UNIT])
+        if old_enabled:
+            _run(["systemctl", "--user", "enable", "--now", OLD_UNIT])
+        elif old_active:
+            _run(["systemctl", "--user", "start", OLD_UNIT])
+        print(f"  {OLD_UNIT}: estado previo restaurado", file=sys.stderr)
         print(f"  revisa: journalctl --user -u {NEW_UNIT}", file=sys.stderr)
         return 1
 
+    # 5. verificado OK -> ahora si migrar: deshabilitar el viejo (no borrarlo)
+    if old_enabled:
+        _run(["systemctl", "--user", "disable", OLD_UNIT])
+        print(f"  {OLD_UNIT}: desactivado (respaldo; la unit se conserva)")
+
     print(f"  {NEW_UNIT}: activo y habilitado")
-    print("  (el watchdog viejo queda desactivado como respaldo)")
     print("  estado: club-autotalplay status")
     print("  logs  : journalctl --user -u club-autotalplay -f")
     return 0
@@ -192,13 +233,18 @@ def uninstall():
     _run(["systemctl", "--user", "disable", "--now", NEW_UNIT])
     print(f"  {NEW_UNIT} detenido y desactivado")
 
-    # restaurar el viejo (respaldo)
     _run(["systemctl", "--user", "daemon-reload"])
-    _run(["systemctl", "--user", "enable", "--now", OLD_UNIT])
-    if _is_active(OLD_UNIT):
-        print(f"  {OLD_UNIT} restaurado y activo")
-    else:
-        print(f"  aviso: {OLD_UNIT} no quedo activo", file=sys.stderr)
 
-    print("  listo: el watchdog viejo vuelve a ser el responsable")
+    # restaurar el viejo SOLO si existe en esta maquina: en una instalacion
+    # limpia de un tercero nunca existio clubwifi-watchdog
+    if _unit_exists(OLD_UNIT):
+        _run(["systemctl", "--user", "enable", "--now", OLD_UNIT])
+        if _is_active(OLD_UNIT):
+            print(f"  {OLD_UNIT} restaurado y activo")
+        else:
+            print(f"  aviso: {OLD_UNIT} no quedo activo", file=sys.stderr)
+        print("  listo: el watchdog viejo vuelve a ser el responsable")
+    else:
+        print(f"  (no hay {OLD_UNIT} en esta maquina; nada que restaurar)")
+        print("  listo: el auto-reconnect quedo removido")
     return 0

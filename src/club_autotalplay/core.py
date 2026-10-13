@@ -158,7 +158,7 @@ def parse_portal_params(location):
 
 
 def _redact_location(location):
-    """Location del portal con ip/mac de la query enmascarados."""
+    """Location del portal con ip/mac/accname de la query enmascarados."""
     if not location:
         return location
     try:
@@ -168,6 +168,9 @@ def _redact_location(location):
             qs["wlanuserip"] = _redact_ip(qs["wlanuserip"])
         if qs.get("wlanparameter"):
             qs["wlanparameter"] = _redact_mac(qs["wlanparameter"])
+        for k in qs:
+            if "acc" in k.lower():  # accname/nombreAcc: identificador de zona
+                qs[k] = "<ACC>"
         new_q = urllib.parse.urlencode(qs)
         return urllib.parse.urlunparse(parts._replace(query=new_q))
     except Exception:
@@ -242,7 +245,11 @@ def _redact_mac(mac):
 
 
 def _redact_params(params):
-    """Copia de params con IP/MAC enmascarada para logs."""
+    """Copia de params con IP/MAC/accname enmascarada para logs.
+
+    accname (p.ej. NEZA-CDMX131207-F1A-A) identifica la zona/AP del cliente:
+    tambien se enmascara.
+    """
     if not params:
         return params
     out = dict(params)
@@ -250,6 +257,8 @@ def _redact_params(params):
         out["ip"] = _redact_ip(out["ip"])
     if out.get("mac"):
         out["mac"] = _redact_mac(out["mac"])
+    if out.get("nombreAcc"):
+        out["nombreAcc"] = "<ACC>"
     return out
 
 
@@ -321,6 +330,12 @@ def wifi_connected():
 
 
 def current_ssid():
+    """SSID REAL de la red WiFi conectada (no el nombre del perfil de NM).
+
+    GENERAL.CONNECTION devuelve el nombre del *perfil* de NetworkManager,
+    que el usuario pudo haber renombrado ("Mi Club" != SSID real). El SSID
+    verdadero vive en la propiedad 802-11-wireless.ssid del perfil.
+    """
     if IS_WINDOWS:
         for line in _windows_wlan_show().splitlines():
             s = line.strip()
@@ -333,9 +348,22 @@ def current_ssid():
     if not dev:
         return ""
     try:
-        return _run(["nmcli", "-t", "-f", "GENERAL.CONNECTION", "dev", "show", dev]).stdout.split(":", 1)[-1].strip()
+        profile = _run(
+            ["nmcli", "-t", "-f", "GENERAL.CONNECTION", "dev", "show", dev]
+        ).stdout.split(":", 1)[-1].strip()
     except Exception:
         return ""
+    if not profile or profile == "--":
+        return ""  # sin conexion activa
+    # el perfil puede estar renombrado: pedir el SSID que tiene configurado
+    try:
+        r = _run(["nmcli", "-g", "802-11-wireless.ssid", "connection", "show", profile])
+        ssid = r.stdout.strip()
+        if r.returncode == 0 and ssid:
+            return ssid
+    except Exception:
+        pass
+    return profile  # fallback: perfil sin renombrar se llama como el SSID
 
 
 def bring_up_wifi():
@@ -442,6 +470,19 @@ def cycle(state):
         state["fail_streak"] = 0
         return "online"
 
+    # Guard de red ajena (todo el ciclo): si el WiFi esta en OTRA red
+    # (oficina/casa), no ejecutamos NINGUNA recuperacion — el captive seria
+    # de otro portal (grant equivocado) y el bounce mataria su conexion.
+    # bring_up_wifi repite el guard como defensa en profundidad.
+    cur = current_ssid()
+    if cur and cur != SSID:
+        state["fail_streak"] = 0
+        log.warning(
+            "probe=%s pero el WiFi esta en otra red (%r != %r); no toco nada",
+            st, cur, SSID,
+        )
+        return "other-network"
+
     state["fail_streak"] = int(state.get("fail_streak") or 0) + 1
     streak = state["fail_streak"]
     escalate = streak >= FAIL_STREAK_ESCALATE
@@ -522,6 +563,17 @@ def debug_dump(perform_grant=True, redact=False):
     def p(k, v):
         out.append(f"{k:24}: {v}")
 
+    def h(k, v):
+        """Header para debug: cookies y authorization se enmascaran con redact."""
+        if not redact:
+            return v
+        kl = k.lower()
+        if kl in ("set-cookie", "cookie", "authorization"):
+            return "(redactado)"
+        if kl == "location":
+            return _redact_location(v)
+        return v
+
     p("platform", sys.platform)
     p("IS_WINDOWS", IS_WINDOWS)
     p("STATE_PATH", STATE_PATH)
@@ -546,21 +598,17 @@ def debug_dump(perform_grant=True, redact=False):
         loc = resp.headers.get("Location")
         body = resp.read()[:200]
         p("probe_status", code)
-        p("probe_location", _redact_location(loc) if redact else (loc or "-"))
+        p("probe_location", h("Location", loc) if redact else (loc or "-"))
         p("probe_body", repr(body))
         for k, v in resp.headers.items():
-            if redact and k.lower() == "location":
-                v = _redact_location(v)
-            p(f"probe_hdr {k}", v)
+            p(f"probe_hdr {k}", h(k, v))
         probe_st = "online" if code == 204 else ("captive" if loc else "down")
     except urllib.error.HTTPError as e:
         loc = e.headers.get("Location")
         p("probe_status", f"HTTPError {e.code}")
-        p("probe_location", _redact_location(loc) if redact else (loc or "-"))
+        p("probe_location", h("Location", loc) if redact else (loc or "-"))
         for k, v in e.headers.items():
-            if redact and k.lower() == "location":
-                v = _redact_location(v)
-            p(f"probe_hdr {k}", v)
+            p(f"probe_hdr {k}", h(k, v))
         probe_st = "captive" if (e.code in (301, 302, 303, 307, 308) and loc) else "down"
     except Exception as e:
         p("probe_error", f"{type(e).__name__}: {e}")
@@ -582,9 +630,7 @@ def debug_dump(perform_grant=True, redact=False):
             p("portalGET_status", gr.getcode())
             for k, v in gr.headers.items():
                 if k.lower() in ("location", "set-cookie", "content-type"):
-                    if redact and k.lower() == "location":
-                        v = _redact_location(v)
-                    p(f"portalGET_hdr {k}", v)
+                    p(f"portalGET_hdr {k}", h(k, v))
             p("portalGET_body", repr(gb))
         except Exception as e:
             p("portalGET_error", f"{type(e).__name__}: {e}")
@@ -611,7 +657,7 @@ def debug_dump(perform_grant=True, redact=False):
             conn.close()
             p("grant_status", f"{r.status} {r.reason}")
             for k, v in r.getheaders():
-                p(f"grant_hdr {k}", v)
+                p(f"grant_hdr {k}", h(k, v))
             p("grant_body_resp", repr(rb[:300]))
         except Exception as e:
             p("grant_error", f"{type(e).__name__}: {e}")

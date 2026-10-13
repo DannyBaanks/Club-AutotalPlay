@@ -144,9 +144,24 @@ POST https://clubwifi.totalplay.com.mx/ClubMovil/video-completado
 - **`install` en Windows apunta al `.exe` de bandeja que esté junto al de
   consola.** Si mueves o borras la carpeta de los `.exe`, el acceso directo de
   inicio se rompe. Vuelve a correr `install` desde la nueva ubicación.
+- **`install` (Linux) verifica antes de migrar.** Arranca el servicio nuevo,
+  espera a que quede `active` y solo entonces deshabilita el watchdog viejo.
+  Si el nuevo no levanta, revierte todo al estado previo (nada queda a medias).
+  Desde un AppImage, el servicio apunta al AppImage mismo (no al montaje
+  temporal), así que sigue funcionando tras reiniciar.
+- **`uninstall` (Linux) solo restaura el watchdog viejo si existía.** En una
+  máquina limpia nunca hubo `clubwifi-watchdog`; ahí simplemente remueve el
+  servicio y listo.
 - **No corras el daemon a la vez desde la consola (`run`) y desde la bandeja.**
-  El tray detecta un daemon vivo y no spawnea otro (hay guard), pero si el
-  `pid` del `state.json` quedó de otro usuario/máquina el guard no aplica.
+  El tray detecta un daemon vivo y no spawnea otro (hay guard), y todos los
+  ciclos (del daemon y de "Reconectar ahora") pasan por un lock de archivo,
+  así que dos recuperaciones nunca compiten.
+- **`debug` sale redactado por defecto** (IP/MAC/accname/cookies ocultos).
+  Usa `debug --full` solo para tu propio análisis y no compartas esa salida
+  sin revisarla.
+- **En otra red (oficina/casa) el daemon no toca nada.** Si el WiFi está
+  conectado a una red que no es `Club_Totalplay_WiFi`, ni grantea el portal
+  ajeno ni re-botea el radio. Vuelve a nuestra red y sigue trabajando.
 - **Windows marca "Acción necesaria" en el WiFi.** Eso lo hace el sistema
   operativo, no el portal. Mientras el daemon corra, la sesión se renueva sola
   aunque esa etiqueta aparezca un momento.

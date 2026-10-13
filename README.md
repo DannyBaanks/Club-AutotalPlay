@@ -85,8 +85,9 @@ Club-AutotalPlay.exe status        :: estado (lee/red)
 Club-AutotalPlay.exe status --live :: fuerza sondeo real
 Club-AutotalPlay.exe once          :: un ciclo de reconexión
 Club-AutotalPlay.exe run           :: daemon en foreground (sin bandeja)
-Club-AutotalPlay.exe debug         :: vuelca probe/portal/grant en crudo
+Club-AutotalPlay.exe debug         :: diagnóstico (IP/MAC/accname redactados)
 Club-AutotalPlay.exe debug --dry   :: solo el probe (sin tocar el portal)
+Club-AutotalPlay.exe debug --full  :: sin redactar (para tu propio análisis)
 Club-AutotalPlay.exe install       :: autostart al iniciar sesión
 Club-AutotalPlay.exe uninstall     :: quita el autostart
 ```

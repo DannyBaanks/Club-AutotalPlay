@@ -109,9 +109,13 @@ def _cmd_gui(args):
 
 
 def _cmd_debug(args):
-    """Vuelca el estado crudo de probe/portal/grant para capturar un corte."""
+    """Vuelca el estado de probe/portal/grant para capturar un corte.
+
+    Redactado por defecto (IP/MAC/accname/cookies enmascarados); --full
+    muestra el detalle crudo para diagnostico propio.
+    """
     core.setup_logging(to_stdout=False)
-    print(core.debug_dump(perform_grant=not args.dry))
+    print(core.debug_dump(perform_grant=not args.dry, redact=not args.full))
     return 0
 
 
@@ -136,9 +140,11 @@ def main(argv=None):
                           help="fuerza un probe real de la red")
     p_status.set_defaults(func=_cmd_status)
 
-    p_dbg = sub.add_parser("debug", help="diagnostico crudo (probe+portal+grant) para capturar un corte")
+    p_dbg = sub.add_parser("debug", help="diagnostico (probe+portal+grant) para capturar un corte")
     p_dbg.add_argument("--dry", action="store_true",
                        help="solo probe; no hace GET ni POST al portal")
+    p_dbg.add_argument("--full", action="store_true",
+                       help="sin redaccion: muestra IP/MAC/accname crudos")
     p_dbg.set_defaults(func=_cmd_debug)
 
     p_inst = sub.add_parser("install", help="instala el servicio systemd user (M4)")
