@@ -33,7 +33,7 @@ def _state_name(state):
     if state.get("online"):
         return "online"
     if state.get("probe") == "captive" or state.get("last_action") in (
-        "granted", "granted-after-bounce", "bounced", "cooldown", "bounce-cooldown",
+        "granted", "granted-cached", "granted-after-bounce", "bounced", "cooldown", "bounce-cooldown",
     ):
         return "reconnecting"
     return "offline"

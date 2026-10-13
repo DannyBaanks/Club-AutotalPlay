@@ -168,7 +168,7 @@ def _cycle_lock(timeout=LOCK_TIMEOUT):
 
 
 # Acciones del ciclo que ya garantizan online verificado (sin re-probar).
-_ONLINE_ACTIONS = ("online", "granted", "granted-after-bounce", "bounced")
+_ONLINE_ACTIONS = ("online", "granted", "granted-cached", "granted-after-bounce", "bounced")
 
 
 def _refresh_state(state, action):

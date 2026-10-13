@@ -26,7 +26,9 @@ sesión nueva — y vuelves a tener internet.
 1. Cada ~20 s sondea `http://connectivitycheck.gstatic.com/generate_204`.
 2. Si responde `302` (hubo corte), parsea IP / MAC / `accname` del `Location` del portal.
 3. Manda el `POST` a `/ClubMovil/video-completado` → `204` = sesión otorgada.
-4. Si no basta, re-botea el WiFi por `nmcli` como respaldo.
+4. Si el sondeo se cae del todo pero el WiFi sigue asociado, reintenta ese
+   `POST` con los últimos parámetros conocidos — **sin tocar el radio**.
+5. Si ni eso basta, re-botea el WiFi por `nmcli` como último recurso.
 
 Todo en segundo plano, con un **icono en la bandeja** que cambia de color:
 

@@ -177,8 +177,23 @@ def _redact_location(location):
         return "<location no parseable>"
 
 
-def grant_session(params):
-    """POST al endpoint que otorga la sesion. Devuelve True si 2xx."""
+def grant_session(params, retries=1):
+    """POST al endpoint que otorga la sesion. Devuelve True si 2xx.
+
+    El portal a veces falla intermitentemente (IncompleteRead / Remote end
+    closed, visto 2026-10-13 04:02-04:48): se reintenta `retries` veces con
+    1 s de separacion antes de declarar fracaso.
+    """
+    for intento in range(retries + 1):
+        if _grant_session_once(params):
+            return True
+        if intento < retries:
+            log.warning("grant fallo (intento %d/%d); reintentando...", intento + 1, retries + 1)
+            time.sleep(1)
+    return False
+
+
+def _grant_session_once(params):
     body = json.dumps(params).encode("utf-8")
     ctx = ssl.create_default_context()
     try:
@@ -437,6 +452,7 @@ def handle_captive(location, state):
     if verify_online(deadline=40):
         log.info("SESION OTORGADA - internet restaurado")
         state["last_grant_ok"] = now_iso()
+        state["last_portal_params"] = params  # cache p/ grant sin bounce
         return True
     log.warning("grant aceptado pero el probe sigue sin 204; intento re-botear WiFi")
     return False
@@ -458,6 +474,7 @@ def _try_grant_from_probe(state):
         p = parse_portal_params(loc)
         if p and grant_session(p) and verify_online(deadline=20):
             state["last_grant_ok"] = now_iso()
+            state["last_portal_params"] = p  # cache p/ grant sin bounce
             log.info("SESION OTORGADA")
             return True
     return False
@@ -492,6 +509,12 @@ def cycle(state):
     )
 
     if st == "captive":
+        # Cache de params ANTES del cooldown/grant: la URL del redirect trae
+        # ip/mac/accname frescos; si el grant falla o esta en cooldown, no se
+        # pierden (el camino "down" los usara despues sin bounce).
+        parsed = parse_portal_params(location)
+        if parsed:
+            state["last_portal_params"] = parsed
         last = state.get("last_grant_attempt", "")
         can_grant = escalate or not (last and (time.time() - _iso_to_epoch(last)) < COOLDOWN_SECONDS)
         if can_grant:
@@ -504,6 +527,29 @@ def cycle(state):
         else:
             log.info("cooldown de grant activo (%s); sin grant, pruebo bounce", last)
         # grant no disponible o fallo -> cae al bounce YA (sin return precoz)
+
+    elif st == "down" and wifi_connected():
+        # "down" con el WiFi ASOCIADO: casi siempre es la sesion del portal
+        # que murio (el AP suelta el trafico) — no hace falta re-botear el
+        # radio. El portal sigue alcanzable: grant con los ULTIMOS params
+        # conocidos (ip/mac/accname estables en la misma AP) restaura la
+        # sesion sin desconectar el link. El radio queda para cuando el
+        # grant no basto (cae al bounce de abajo).
+        cached = state.get("last_portal_params")
+        last = state.get("last_grant_attempt", "")
+        can_grant = escalate or not (last and (time.time() - _iso_to_epoch(last)) < COOLDOWN_SECONDS)
+        if cached and can_grant:
+            state["last_grant_attempt"] = now_iso()
+            save_state(state)
+            if grant_session(cached) and verify_online(deadline=15):
+                state["last_grant_ok"] = now_iso()
+                state["last_portal_params"] = cached
+                state["fail_streak"] = 0
+                log.info("SESION OTORGADA (params cacheados; radio intacto)")
+                return "granted-cached"
+            # grant fallo (portal inalcanzable?) -> cae al bounce
+        elif not cached:
+            log.info("sin params cacheados del portal; cae al bounce")
 
     # "down" o grant fallido: quizas el WiFi se cayo. Re-botear con cooldown.
     if not wifi_connected():

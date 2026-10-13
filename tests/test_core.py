@@ -577,6 +577,142 @@ def test_run_sale_limpio_si_otro_daemon_vive(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# ciclo: down con WiFi ASOCIADO -> grant con params cacheados (sin bounce)
+# (evidencia 2026-10-13 04:02-04:36: sesiones de 20-40s, todas con el link
+#  arriba; el bounce era innecesario y alimentaba el flapping del AP)
+# ---------------------------------------------------------------------------
+
+def test_ciclo_down_wifi_ok_grant_cacheado(monkeypatch):
+    """down + WiFi conectado + params cacheados -> grant directo, radio intacto."""
+    monkeypatch.setattr(core, "probe", lambda: ("down", None))
+    monkeypatch.setattr(core, "current_ssid", lambda: core.SSID)
+    monkeypatch.setattr(core, "wifi_connected", lambda: True)
+    monkeypatch.setattr(core, "grant_session", lambda p: True)
+    monkeypatch.setattr(core, "verify_online", lambda deadline=0: True)
+    monkeypatch.setattr(core, "save_state", lambda s: None)
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+
+    def forbidden():
+        raise AssertionError("no debe re-botear el radio si el grant funciona")
+
+    monkeypatch.setattr(core, "bring_up_wifi", forbidden)
+
+    state = _fresh_state(last_portal_params=dict(PORTAL_PARAMS))
+    action = core.cycle(state)
+    assert action == "granted-cached"
+    assert state["fail_streak"] == 0
+    assert state["last_grant_ok"]
+    assert state["last_portal_params"] == dict(PORTAL_PARAMS)  # se re-cachea
+
+
+def test_ciclo_down_wifi_ok_grant_cacheado_falla_bounce(monkeypatch):
+    """El grant cacheado no basta (portal inalcanzable) -> cae al bounce."""
+    monkeypatch.setattr(core, "probe", lambda: ("down", None))
+    monkeypatch.setattr(core, "current_ssid", lambda: core.SSID)
+    monkeypatch.setattr(core, "wifi_connected", lambda: True)
+    monkeypatch.setattr(core, "grant_session", lambda p: False)
+    monkeypatch.setattr(core, "save_state", lambda s: None)
+    monkeypatch.setattr(core, "bring_up_wifi", lambda: True)
+    monkeypatch.setattr(core, "_try_grant_from_probe", lambda s: True)
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+
+    state = _fresh_state(last_portal_params=dict(PORTAL_PARAMS))
+    action = core.cycle(state)
+    assert action == "bounced"
+
+
+def test_ciclo_down_wifi_ok_sin_cache_bounce(monkeypatch):
+    """down + WiFi conectado + sin params cacheados -> bounce (primer arranque)."""
+    monkeypatch.setattr(core, "probe", lambda: ("down", None))
+    monkeypatch.setattr(core, "current_ssid", lambda: core.SSID)
+    monkeypatch.setattr(core, "wifi_connected", lambda: True)
+    monkeypatch.setattr(core, "save_state", lambda s: None)
+    monkeypatch.setattr(core, "bring_up_wifi", lambda: True)
+    monkeypatch.setattr(core, "_try_grant_from_probe", lambda s: True)
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+
+    state = _fresh_state()  # sin last_portal_params
+    action = core.cycle(state)
+    assert action == "bounced"
+
+
+def test_ciclo_down_wifi_ok_grant_respeta_cooldown(monkeypatch):
+    """Con cooldown de grant activo y sin escalada, no spammea el portal."""
+    monkeypatch.setattr(core, "probe", lambda: ("down", None))
+    monkeypatch.setattr(core, "current_ssid", lambda: core.SSID)
+    monkeypatch.setattr(core, "wifi_connected", lambda: True)
+    monkeypatch.setattr(core, "save_state", lambda s: None)
+    monkeypatch.setattr(core, "bring_up_wifi", lambda: False)
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+
+    def forbidden(p):
+        raise AssertionError("no debe grantear con cooldown activo")
+
+    monkeypatch.setattr(core, "grant_session", forbidden)
+
+    state = _fresh_state(
+        last_portal_params=dict(PORTAL_PARAMS),
+        last_grant_attempt=core.now_iso(),  # hace un segundo
+    )
+    action = core.cycle(state)
+    # grant en cooldown -> sin bounce exitoso -> failed
+    assert action == "failed"
+
+
+def test_ciclo_escalada_ignora_cooldown_del_grant_cacheado(monkeypatch):
+    """fail_streak >= 5 fuerza el intento de grant aunque haya cooldown."""
+    monkeypatch.setattr(core, "probe", lambda: ("down", None))
+    monkeypatch.setattr(core, "current_ssid", lambda: core.SSID)
+    monkeypatch.setattr(core, "wifi_connected", lambda: True)
+    monkeypatch.setattr(core, "grant_session", lambda p: True)
+    monkeypatch.setattr(core, "verify_online", lambda deadline=0: True)
+    monkeypatch.setattr(core, "save_state", lambda s: None)
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+
+    state = _fresh_state(
+        fail_streak=core.FAIL_STREAK_ESCALATE - 1,  # este ciclo llega al umbral
+        last_portal_params=dict(PORTAL_PARAMS),
+        last_grant_attempt=core.now_iso(),  # cooldown activo
+    )
+    action = core.cycle(state)
+    assert action == "granted-cached"
+
+
+def test_grant_session_reintenta(monkeypatch):
+    """El portal falla intermitente: el reintento interno salva el grant."""
+    calls = {"n": 0}
+
+    def once(p):
+        calls["n"] += 1
+        return calls["n"] == 2  # falla la 1a, acierta la 2a
+
+    monkeypatch.setattr(core, "_grant_session_once", once)
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+    assert core.grant_session(PORTAL_PARAMS) is True
+    assert calls["n"] == 2
+
+
+def test_ciclo_captive_cachea_params_aunque_grant_en_cooldown(monkeypatch):
+    """Captive con cooldown de grant: los params del redirect NO se pierden."""
+    monkeypatch.setattr(core, "probe", lambda: ("captive", CAPTIVE_LOC))
+    monkeypatch.setattr(core, "current_ssid", lambda: core.SSID)
+    monkeypatch.setattr(core, "wifi_connected", lambda: True)
+    monkeypatch.setattr(core, "save_state", lambda s: None)
+    monkeypatch.setattr(core, "bring_up_wifi", lambda: False)
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+
+    def forbidden(p):
+        raise AssertionError("no debe grantear con cooldown activo")
+
+    monkeypatch.setattr(core, "grant_session", forbidden)
+
+    state = _fresh_state(last_grant_attempt=core.now_iso())  # cooldown activo
+    action = core.cycle(state)
+    assert action == "failed"  # sin grant ni bounce exitosos
+    assert state["last_portal_params"] == PORTAL_PARAMS  # params cacheados igual
+
+
+# ---------------------------------------------------------------------------
 # handle_captive
 # ---------------------------------------------------------------------------
 
