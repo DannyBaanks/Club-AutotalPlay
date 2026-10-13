@@ -14,11 +14,13 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: write   # para subir el AppImage a un Release (solo aplica con tag)
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -58,20 +60,36 @@ jobs:
           ls -la dist/
           ./dist/Club-AutotalPlay-x86_64.AppImage status
 
-      - name: Subir a Release (si hay tag)
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release view "${{ github.ref_name }}" >/dev/null 2>&1 || \
-            gh release create "${{ github.ref_name }}" --verify-tag \
-              --title "${{ github.ref_name }}" --notes "Build automático desde CI"
-          gh release upload "${{ github.ref_name }}" \
-            dist/Club-AutotalPlay-x86_64.AppImage \
-            --clobber
-
       - name: Guardar artifact (siempre)
         uses: actions/upload-artifact@v4
         with:
           name: Club-AutotalPlay-linux-x86_64
           path: dist/Club-AutotalPlay-x86_64.AppImage
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Descargar AppImage validado
+        uses: actions/download-artifact@v4
+        with:
+          name: Club-AutotalPlay-linux-x86_64
+          path: dist
+
+      - name: Subir a Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release create "$TAG_NAME" --verify-tag \
+              --title "$TAG_NAME" --notes "Build automático desde CI" || \
+              gh release view "$TAG_NAME" >/dev/null
+          fi
+          gh release upload "$TAG_NAME" \
+            dist/Club-AutotalPlay-x86_64.AppImage \
+            --clobber
