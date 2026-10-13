@@ -187,7 +187,17 @@ def grant_session(params):
 
 
 def _run(cmd, timeout=15):
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    """Ejecuta un subprocess sin ventana de consola visible en Windows.
+
+    Sin CREATE_NO_WINDOW, cuando el padre es windowed (la bandeja) cada
+    `netsh` abre una consola nueva que parpadea en pantalla — y el daemon lo
+    llama cada ~20 s, asi que salia una ventana por ciclo.
+    """
+    kwargs = {}
+    if IS_WINDOWS:
+        # 0x08000000 = CREATE_NO_WINDOW (el hijo no recibe consola)
+        kwargs["creationflags"] = 0x08000000
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kwargs)
 
 
 def _windows_wlan_show():
@@ -230,8 +240,11 @@ def bring_up_wifi():
         # analogo de `nmcli connection up`: conecta a un perfil WiFi guardado.
         log.info("levantando WiFi: netsh wlan connect name=%s", SSID)
         r = _run(["netsh", "wlan", "connect", f"name={SSID}"], timeout=30)
-        msg = (r.stdout + r.stderr).lower()
-        if r.returncode == 0 and ("se conect" in msg or "connected" in msg):
+        # netsh devuelve 0 en exito. El mensaje viene localizado (en ES:
+        # "La solicitud de conexion se completo correctamente"), asi que NO se
+        # decide por texto — con locale ES el chequeo viejo ("se conect" /
+        # "connected") no matcheaba y reportaba fallo en un exito.
+        if r.returncode == 0:
             log.info("WiFi OK: %s", (r.stdout or r.stderr).strip())
             return True
         log.error("netsh fallo rc=%s out=%s err=%s", r.returncode, r.stdout.strip(), r.stderr.strip())
@@ -257,6 +270,7 @@ def verify_online(deadline=45):
 
 
 def handle_captive(location, state):
+    maybe_autocapture("handle_captive")
     params = parse_portal_params(location)
     if not params:
         log.error("no pude parsear params del portal; location=%s", location)
@@ -335,6 +349,138 @@ def print_status():
     for k in ("last_grant_ok", "last_grant_attempt", "last_bounce"):
         if s.get(k):
             print(f"{k:14}: {s[k]}")
+
+
+def debug_dump(perform_grant=True):
+    """Diagnostico crudo para capturar un corte real (sobre todo Windows).
+
+    Duerme cero y no aplica cooldowns: imprime el estado de cada paso tal
+    cual, para poder comparar un corte de Windows contra uno de Linux y
+    separar estas hipotesis:
+      A) el probe no ve el 302 (p.ej. proxy del sistema)  -> probe_result
+      B) el portal exige un GET previo (priming/cookie)   -> portalGET_*
+      C) el User-Agent cambia el flujo                    -> grant_*
+    Devuelve el texto; el CLI decide donde imprimirlo.
+    """
+    out = []
+
+    def p(k, v):
+        out.append(f"{k:24}: {v}")
+
+    p("platform", sys.platform)
+    p("IS_WINDOWS", IS_WINDOWS)
+    p("STATE_PATH", STATE_PATH)
+    try:
+        proxies = urllib.request.getproxies()
+    except Exception as e:
+        proxies = {"_error": str(e)}
+    p("urllib.getproxies()", json.dumps(proxies) if proxies else "(vacio)")
+    for var in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"):
+        if os.environ.get(var):
+            p(f"env {var}", os.environ[var])
+    p("USER_AGENT", USER_AGENT)
+
+    # --- probe crudo (hipotesis A) --------------------------------------
+    loc = None
+    url = f"http://{PROBE_HOST}:{PROBE_PORT}{PROBE_PATH}"
+    p("probe_url", url)
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        resp = _opener.open(req, timeout=TIMEOUT)
+        code = resp.getcode()
+        loc = resp.headers.get("Location")
+        body = resp.read()[:200]
+        p("probe_status", code)
+        p("probe_location", loc or "-")
+        p("probe_body", repr(body))
+        for k, v in resp.headers.items():
+            p(f"probe_hdr {k}", v)
+        probe_st = "online" if code == 204 else ("captive" if loc else "down")
+    except urllib.error.HTTPError as e:
+        loc = e.headers.get("Location")
+        p("probe_status", f"HTTPError {e.code}")
+        p("probe_location", loc or "-")
+        for k, v in e.headers.items():
+            p(f"probe_hdr {k}", v)
+        probe_st = "captive" if (e.code in (301, 302, 303, 307, 308) and loc) else "down"
+    except Exception as e:
+        p("probe_error", f"{type(e).__name__}: {e}")
+        probe_st = "down"
+    p("probe_result", probe_st)
+
+    p("wifi_connected", wifi_connected())
+    p("current_ssid", current_ssid() or "-")
+
+    params = parse_portal_params(loc) if loc else None
+    p("parsed_params", json.dumps(params) if params else "-")
+
+    # --- hipotesis B: GET previo a la pagina del portal ------------------
+    if loc and perform_grant:
+        try:
+            g = urllib.request.Request(loc, headers={"User-Agent": USER_AGENT})
+            gr = urllib.request.build_opener().open(g, timeout=TIMEOUT)
+            gb = gr.read()[:300]
+            p("portalGET_status", gr.getcode())
+            for k, v in gr.headers.items():
+                if k.lower() in ("location", "set-cookie", "content-type"):
+                    p(f"portalGET_hdr {k}", v)
+            p("portalGET_body", repr(gb))
+        except Exception as e:
+            p("portalGET_error", f"{type(e).__name__}: {e}")
+
+    # --- grant POST (hipotesis C) ---------------------------------------
+    if params and perform_grant:
+        body = json.dumps(params).encode("utf-8")
+        p("grant_url", f"https://{GRANT_HOST}{GRANT_PATH}")
+        p("grant_body", body.decode("utf-8"))
+        ctx = ssl.create_default_context()
+        try:
+            conn = http.client.HTTPSConnection(GRANT_HOST, 443, timeout=TIMEOUT, context=ctx)
+            conn.request(
+                "POST", GRANT_PATH, body=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": USER_AGENT,
+                    "Origin": f"https://{GRANT_HOST}",
+                    "Referer": f"https://{GRANT_HOST}/ClubMovil/inicio?type=DESKTOP",
+                },
+            )
+            r = conn.getresponse()
+            rb = r.read()
+            conn.close()
+            p("grant_status", f"{r.status} {r.reason}")
+            for k, v in r.getheaders():
+                p(f"grant_hdr {k}", v)
+            p("grant_body_resp", repr(rb[:300]))
+        except Exception as e:
+            p("grant_error", f"{type(e).__name__}: {e}")
+
+        st2, _ = probe()
+        p("reprobe_tras_grant", st2)
+
+    return "\n".join(out)
+
+
+# Guarda para que el daemon se autovuelque el diagnostico una vez por episodio
+# captive (no en cada ciclo, o el log se llena de netsh repetido).
+_last_capture = {"t": 0.0}
+
+
+def maybe_autocapture(tag="captive"):
+    """Vuelca debug_dump al log la primera vez que vemos un corte (con cooldown).
+
+    Asi el proximo corte se auto-registra y no hace falta correr `debug` a mano
+    en el segundo exacto. perform_grant=True a proposito: queremos ver el GET
+    al portal y la respuesta cruda del POST (hipotesis B y C).
+    """
+    now = time.time()
+    if now - _last_capture["t"] < COOLDOWN_SECONDS:
+        return
+    _last_capture["t"] = now
+    try:
+        log.info("=== AUTOCAPTURA (%s) ===\n%s", tag, debug_dump(perform_grant=True))
+    except Exception as e:
+        log.warning("autocaptura fallo: %s", e)
 
 
 def main(argv=None):

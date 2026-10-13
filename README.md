@@ -58,15 +58,54 @@ Todo en segundo plano, con un **icono en la bandeja** que cambia de color:
 > `sudo apt install libfuse2t64` (Debian/Ubuntu) o `sudo dnf install fuse-libs` (Fedora).
 
 ### Windows (.exe)
-1. Baja `Club-AutotalPlay.exe` de [Releases](../../releases).
-2. Ábrelo desde una terminal (consola; **aún sin icono de bandeja**):
+
+Hay **dos** `.exe` en [Releases](../../releases):
+
+| .exe | Para qué |
+|---|---|
+| `Club-AutotalPlayTray.exe` | **La app.** Icono en la bandeja (verde/ámbar/rojo) + daemon en segundo plano. Doble click = corriendo. |
+| `Club-AutotalPlay.exe` | **CLI de consola.** Para inspeccionar o correr a mano. |
+
+1. Baja ambos yjalos en la misma carpeta.
+2. Doble click a `Club-AutotalPlayTray.exe` → aparece el icono junto al reloj
+   y el auto-reconnect empieza a sondear cada ~20 s.
+3. Para que arranque **solo al iniciar sesión**:
    ```bat
-   Club-AutotalPlay.exe status        :: estado (lee/red)
-   Club-AutotalPlay.exe once          :: un ciclo de reconexión
-   Club-AutotalPlay.exe run           :: daemon (auto-reconnect en background)
+   Club-AutotalPlay.exe install     :: crea el acceso directo de inicio
+   Club-AutotalPlay.exe uninstall   :: lo quita
    ```
-   Renueva la sesión del portal sola. El icono de bandeja en Windows es trabajo
-   futuro; por ahora es CLI + daemon.
+   Es reversible y no borra nada. El acceso directo queda en la carpeta de
+   inicio (`shell:startup`), visible en *Administrador de tareas → Apps de
+   inicio*, donde puedes desactivarlo.
+
+**CLI de consola** (todo desde una terminal):
+
+```bat
+Club-AutotalPlay.exe status        :: estado (lee/red)
+Club-AutotalPlay.exe status --live :: fuerza sondeo real
+Club-AutotalPlay.exe once          :: un ciclo de reconexión
+Club-AutotalPlay.exe run           :: daemon en foreground (sin bandeja)
+Club-AutotalPlay.exe debug         :: vuelca probe/portal/grant en crudo
+Club-AutotalPlay.exe debug --dry   :: solo el probe (sin tocar el portal)
+Club-AutotalPlay.exe install       :: autostart al iniciar sesión
+Club-AutotalPlay.exe uninstall     :: quita el autostart
+```
+
+> **Nota de diagnóstico.** En Windows el portal de Totalplay se comporta igual
+> que en Linux: el `POST` a `/ClubMovil/video-completado` devuelve `204` y
+> otorga la sesión. El motivo típico de "no me reconecta sola" **no** es el
+> HTTP, es que **nadie deja el daemon corriendo** (no hay autostart ni bandeja
+> y Windows exige el paso manual de *Acción necesaria*). Por eso `install` +
+> la bandeja son lo que lo deja 1:1 con Linux.
+>
+> Si aun así falla, `Club-AutotalPlay.exe debug` imprime el estado crudo de
+> cada paso (proxy del sistema, `Location` del portal, `GET` a la página, y la
+> respuesta del `POST`). El daemon además se autovuelca esto al log la primera
+> vez que ve un captive portal: léelo en
+> `%LOCALAPPDATA%\club-autotalplay\watchdog.log`.
+
+- Log: `%LOCALAPPDATA%\club-autotalplay\watchdog.log`
+- Estado: `%LOCALAPPDATA%\club-autotalplay\state.json`
 
 ## Uso
 
@@ -108,12 +147,33 @@ pip install -e '.[gui]'                 # gui = pystray + Pillow + python-xlib
 ./packaging/build_appimage.sh           # genera dist/Club-AutotalPlay-x86_64.AppImage
 ```
 
+**Windows** (consola + bandeja, PowerShell):
+
+```powershell
+pip install -e . pyinstaller pystray Pillow
+
+# 1) .exe de consola (CLI)
+pyinstaller --noconfirm --clean --onefile --name Club-AutotalPlay `
+  --distpath dist --workpath build/pyi-work --specpath build --paths src `
+  packaging/console_entry.py
+
+# 2) .exe de bandeja (windowed; el ; es el separador de --add-data en Windows)
+pyinstaller --noconfirm --clean --onefile --windowed --name Club-AutotalPlayTray `
+  --add-data "src/club_autotalplay/assets;club_autotalplay/assets" `
+  --hidden-import pystray._win32 --collect-all pystray --collect-all PIL `
+  --distpath dist --workpath build/pyi-work-tray --specpath build --paths src `
+  packaging/tray_entry.py
+```
+
+> El CI (`.github/workflows/windows-exe.yml`) hace exactamente esto y sube
+> ambos `.exe` al Release cuando hay tag.
+
 ## Requisitos
 
 - **Linux:** NetworkManager (`nmcli`). El core depende de él.
-- **Windows:** nada extra (usa `netsh`); el `.exe` es standalone.
-- Python ≥ 3.9 (el core es solo stdlib; la app de escritorio Linux usa `pystray`+`Pillow`).
-- GNOME/X11 para el icono de bandeja Linux (en Wayland puede requerir la extensión AppIndicator).
+- **Windows:** nada extra (usa `netsh`); los dos `.exe` son standalone.
+- Python ≥ 3.9 (el core es solo stdlib; la app de escritorio usa `pystray`+`Pillow`, ya empaquetados en los `.exe`).
+- GNOME/X11 para el icono de bandeja Linux (en Wayland puede requerir la extensión AppIndicator). En Windows la bandeja usa el backend win32 nativo de `pystray` (sin dependencias).
 
 ## Cómo funciona el portal (detalles)
 
@@ -125,6 +185,111 @@ GET  http://connectivitycheck.gstatic.com/generate_204
 POST https://clubwifi.totalplay.com.mx/ClubMovil/video-completado
      {"ip":…, "mac":…, "nombreAcc":…, "tipo":"DESKTOP"}
   → 204 No Content   (sesión otorgada)
+```
+
+## Pruebas e2e en Windows
+
+Todo lo de esta sección se capturó en una máquina Windows real contra la red
+`Club_Totalplay_WiFi`, con el `.exe` empaquetado (no con `python -m`).
+Los valores de red (IP / MAC / `accname`) van enmascarados.
+
+### 1. Un corte real: detección → grant → 204 → internet restaurado
+
+Con el daemon corriendo, la sesión expiró y el portal secuestró el tráfico.
+Salida literal del log (`%LOCALAPPDATA%\club-autotalplay\watchdog.log`):
+
+```
+18:33:32 WARNING probe=captive location=https://clubwifi.totalplay.com.mx/ClubMovil/inicio.jsp
+                                    ?wlanuserip=10.x.x.x&wlanacname=
+                                    &wlanparameter=xx-xx-xx-xx-xx-xx&accname=<ACC>
+18:33:33 INFO    captive portal detectado -> otorgando sesion:
+                                    {'ip': '10.x.x.x', 'mac': 'xx-xx-xx-xx-xx-xx',
+                                     'nombreAcc': '<ACC>', 'tipo': 'DESKTOP'}
+18:33:34 INFO    grant POST -> HTTP 204 No Content body=b''
+18:33:34 INFO    SESION OTORGADA - internet restaurado
+18:33:34 INFO    ciclo: granted
+```
+
+Y el `state.json` quedó con el timestamp del grant:
+
+```json
+"last_grant_ok": "2026-10-12T18:33:34-06:00"
+```
+
+Es decir: el `POST` a `/ClubMovil/video-completado` devuelve **`204`** en
+Windows igual que en Linux. **La lógica HTTP no necesita browser ni video.**
+
+### 2. Sin ventana de consola cada 20 s
+
+Antes del fix, la bandeja (proceso *windowed*, sin consola propia) spawneaba
+cada `netsh` con una **consola visible nueva** — una ventana que parpadeaba
+cada ciclo de sondeo. Se arregló pasando `CREATE_NO_WINDOW` a `subprocess`.
+
+Verificación: se muestreó el proceso `netsh` durante 28 s (cubriendo un ciclo
+completo del daemon). Atrapó 2 procesos — los 2 que hace el daemon por ciclo
+— y **ninguno tenía ventana**:
+
+```
+=== netsh capturados durante 28s: 2 ===
+con VENTANA VISIBLE: 0
+=> NINGUNO con ventana visible (CREATE_NO_WINDOW funciona)
+```
+
+### 3. `install` / `uninstall` (autostart)
+
+```
+== instalando autostart (Windows) ==
+  target : C:\...\Club-AutotalPlayTray.exe
+  args   : (ninguno)
+  lnk    : C:\Users\<u>\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\Club-AutotalPlay.lnk
+  OK: la app (bandeja + daemon) arrancara al iniciar sesion
+```
+
+El `.lnk` creado apunta al `.exe` de bandeja con argumentos vacíos (verificado
+leyendo el shortcut: `TargetPath` = el `.exe` de bandeja, `Arguments` = `''`).
+`uninstall` lo elimina.
+
+### 4. Guard de doble-daemon
+
+Con un daemon ya vivo (desde la consola), se lanzó la bandeja. No spawneó un
+segundo daemon — solo leyó el estado:
+
+```
+18:47:01 INFO tray arrancando (daemon en background)
+18:47:01 INFO daemon ya corriendo; el tray solo lee el estado
+```
+
+Y con la bandeja spawneando su propio daemon (sin otro vivo):
+
+```
+18:58:16 INFO tray arrancando (daemon en background)
+18:58:16 INFO daemon iniciado (poll=20s, ssid=Club_Totalplay_WiFi, dev=None, pid=22348)
+```
+
+### 5. Bug de locale corregido (`bring_up_wifi`)
+
+El log original mostraba un **falso fallo** en un éxito real:
+
+```
+18:48:56 ERROR netsh fallo rc=0 out=La solicitud de conexión se completó correctamente.
+```
+
+`netsh` devolvió `rc=0` (éxito) y el mensaje en español no matcheaba los
+tokens `"se conect"` / `"connected"` con los que se decidía el resultado. Ahora
+se confía en `rc==0`, igual que en el branch de Linux.
+
+### Cómo reproducir el e2e
+
+```bat
+:: 1. deja el daemon corriendo
+Club-AutotalPlay.exe run
+
+:: 2. espera a que expire la sesión (~15 min) y revisa el log
+::    %LOCALAPPDATA%\club-autotalplay\watchdog.log
+::    Debes ver: probe=captive -> grant POST -> HTTP 204 -> SESION OTORGADA
+
+:: 3. diagnostico puntual si algo se desvía
+Club-AutotalPlay.exe debug
 ```
 
 ## Licencia

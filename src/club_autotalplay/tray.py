@@ -98,8 +98,12 @@ class TrayApp:
         core.setup_logging()
         log.info("tray arrancando (daemon en background)")
 
-        # el daemon corre en background
-        threading.Thread(target=self._daemon_thread, daemon=True, name="daemon").start()
+        # el daemon corre en background, salvo que ya haya otro vivo (asi no
+        # quedan dos daemons peleando por el cooldown en state.json)
+        if daemon.is_running():
+            log.info("daemon ya corriendo; el tray solo lee el estado")
+        else:
+            threading.Thread(target=self._daemon_thread, daemon=True, name="daemon").start()
 
         menu = Menu(
             MenuItem("Reconectar ahora", self._reconnect_now, default=True),
