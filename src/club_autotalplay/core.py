@@ -47,10 +47,12 @@ USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 )
-POLL_SECONDS = 20          # cada cuantos segundos se chequea
+POLL_SECONDS = 20          # cada cuantos segundos se chequea (red sana)
+POLL_DOWN_SECONDS = 5      # sondeo rapido mientras la red NO esta online
 TIMEOUT = 8                # timeout por request
 COOLDOWN_SECONDS = 45      # no reintentar el grant mas seguido que esto
-WIFI_RETRY_SECONDS = 120   # no re-botear el WiFi mas seguido que esto
+WIFI_RETRY_SECONDS = 30    # no re-botear el WiFi mas seguido que esto
+FAIL_STREAK_ESCALATE = 5   # N ciclos sin online -> reinicio total (ignora cooldowns)
 
 if IS_WINDOWS:
     _base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
@@ -249,7 +251,22 @@ def bring_up_wifi():
             return True
         log.error("netsh fallo rc=%s out=%s err=%s", r.returncode, r.stdout.strip(), r.stderr.strip())
         return False
-    log.info("levantando WiFi: nmcli connection up %s", SSID)
+    # Linux: toggle de radio (el MISMO que el toggle manual del usuario).
+    # `nmcli connection up` a veces falla con "Causa desconocida" cuando el AP
+    # no esta en el escaneo; apagar/prender el radio siempre reconecta.
+    log.info("re-boteando WiFi: nmcli radio wifi off/on")
+    _run(["nmcli", "radio", "wifi", "off"])
+    time.sleep(2)
+    _run(["nmcli", "radio", "wifi", "on"])
+    # esperar a que NetworkManager reconecte a la red conocida
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if wifi_connected():
+            log.info("WiFi OK (radio re-botado y reconnectado)")
+            return True
+        time.sleep(2)
+    # fallback por si el radio no basto
+    log.warning("radio toggle no reconectó en 30s; intento connection up")
     r = _run(["nmcli", "connection", "up", SSID], timeout=45)
     if r.returncode == 0:
         log.info("WiFi OK: %s", r.stdout.strip())
@@ -293,46 +310,70 @@ def _iso_to_epoch(s):
         return 0.0
 
 
+def _try_grant_from_probe(state):
+    """Si el probe dice captive, intenta grant. Devuelve True si restauro online."""
+    st, loc = probe()
+    if st == "online":
+        return True
+    if st == "captive":
+        p = parse_portal_params(loc)
+        if p and grant_session(p) and verify_online(deadline=20):
+            state["last_grant_ok"] = now_iso()
+            log.info("SESION OTORGADA")
+            return True
+    return False
+
+
 def cycle(state):
     """Un ciclo completo del watchdog. Devuelve accion tomada."""
     st, location = probe()
     if st == "online":
+        state["fail_streak"] = 0
         return "online"
 
-    log.warning("probe=%s location=%s", st, location)
+    state["fail_streak"] = int(state.get("fail_streak") or 0) + 1
+    streak = state["fail_streak"]
+    escalate = streak >= FAIL_STREAK_ESCALATE
+    log.warning(
+        "probe=%s location=%s fail_streak=%d%s",
+        st, location, streak, " ESCALANDO (reinicio total)" if escalate else "",
+    )
 
     if st == "captive":
         last = state.get("last_grant_attempt", "")
-        if last and (time.time() - _iso_to_epoch(last)) < COOLDOWN_SECONDS:
-            log.info("cooldown de grant activo (%s); esperando", last)
-            return "cooldown"
-        state["last_grant_attempt"] = now_iso()
-        save_state(state)
-        if handle_captive(location, state):
-            return "granted"
-        # si el grant no basto, caemos al re-botear abajo
+        can_grant = escalate or not (last and (time.time() - _iso_to_epoch(last)) < COOLDOWN_SECONDS)
+        if can_grant:
+            state["last_grant_attempt"] = now_iso()
+            save_state(state)
+            if handle_captive(location, state):
+                state["fail_streak"] = 0
+                return "granted"
+            # grant fallo -> cae al re-botear abajo (no nos quedamos esperando)
+        else:
+            log.info("cooldown de grant activo (%s); sin grant, pruebo bounce", last)
+        # grant no disponible o fallo -> cae al bounce YA (sin return precoz)
 
     # "down" o grant fallido: quizas el WiFi se cayo. Re-botear con cooldown.
     if not wifi_connected():
         log.warning("WiFi no conectado (ssid=%r)", current_ssid())
     last_bounce = state.get("last_bounce", "")
-    if last_bounce and (time.time() - _iso_to_epoch(last_bounce)) < WIFI_RETRY_SECONDS:
+    can_bounce = escalate or not (last_bounce and (time.time() - _iso_to_epoch(last_bounce)) < WIFI_RETRY_SECONDS)
+    if not can_bounce:
         log.info("cooldown de bounce WiFi activo (%s)", last_bounce)
         return "bounce-cooldown"
     state["last_bounce"] = now_iso()
     save_state(state)
     if bring_up_wifi():
-        time.sleep(4)
-        if verify_online(deadline=40):
-            # tras re-botear puede quedar captive: intenta grant una vez mas
-            st2, loc2 = probe()
-            if st2 == "captive":
-                p = parse_portal_params(loc2)
-                if p and grant_session(p) and verify_online(deadline=30):
-                    log.info("SESION OTORGADA tras bounce")
-                    return "granted-after-bounce"
-            log.info("internet restaurado tras bounce de WiFi")
-            return "bounced"
+        time.sleep(3)
+        # Tras re-botear puede quedar captive o tardar en subir: sondear y
+        # (si hace falta) grant en loop corto, no un solo verify_online.
+        deadline = time.time() + 40
+        while time.time() < deadline:
+            if _try_grant_from_probe(state):
+                state["fail_streak"] = 0
+                log.info("internet restaurado tras bounce de WiFi")
+                return "bounced"
+            time.sleep(3)
     return "failed"
 
 

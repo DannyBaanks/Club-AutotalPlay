@@ -14,7 +14,6 @@ pystray usa AppIndicator/ayatana si esta disponible).
 from __future__ import annotations
 
 import logging
-import os
 import threading
 import time
 
@@ -56,6 +55,33 @@ class TrayApp:
         self._icon = None
         self._gui_proc = None
 
+    # --- daemon existente ---------------------------------------------------
+    @staticmethod
+    def _daemon_already_running():
+        """¿Hay ya un daemon vivo (p.ej. el servicio systemd)?
+
+        Mira el state.json: si es fresco y su pid sigue vivo, otro daemon
+        (servicio) ya esta trabajando — el tray no debe spawnearear otro.
+        """
+        state = core.load_state()
+        pid = state.get("pid")
+        if not pid:
+            return False
+        updated = state.get("updated_at")
+        if updated:
+            try:
+                from datetime import datetime
+                age = (datetime.now().astimezone() - datetime.fromisoformat(updated)).total_seconds()
+            except Exception:
+                age = None
+            if age is None or age > core.POLL_SECONDS * 3:
+                return False  # estado viejo: el pid no sirve
+        # NO usar os.kill(pid, 0) aqui: en Windows eso NO sondea, llama a
+        # TerminateProcess y MATARIA al daemon en vez de preguntar si vive
+        # (verificado: victim murio con rc=0xC000013A). daemon._pid_alive usa
+        # OpenProcess/GetExitCodeProcess en Windows y kill(pid,0) en POSIX.
+        return daemon._pid_alive(pid)
+
     # --- threads -----------------------------------------------------------
     def _daemon_thread(self):
         # daemon.run es bloqueante; corre en este thread. Usa su propio loop.
@@ -96,13 +122,13 @@ class TrayApp:
         from pystray import Menu, MenuItem
 
         core.setup_logging()
-        log.info("tray arrancando (daemon en background)")
 
-        # el daemon corre en background, salvo que ya haya otro vivo (asi no
-        # quedan dos daemons peleando por el cooldown en state.json)
-        if daemon.is_running():
-            log.info("daemon ya corriendo; el tray solo lee el estado")
+        # el daemon: solo se spawnea si no hay otro vivo (servicio systemd).
+        # si ya corre uno, el tray solo lo observa (lee su state.json).
+        if self._daemon_already_running():
+            log.info("daemon ya corriendo (servicio); el tray solo lo observa")
         else:
+            log.info("tray arrancando (daemon en background)")
             threading.Thread(target=self._daemon_thread, daemon=True, name="daemon").start()
 
         menu = Menu(

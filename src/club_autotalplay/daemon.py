@@ -30,11 +30,19 @@ STATE_KEYS = (
 )
 
 
+# Acciones del ciclo que ya garantizan online verificado (sin re-probar).
+_ONLINE_ACTIONS = ("online", "granted", "granted-after-bounce", "bounced")
+
+
 def _refresh_state(state, action):
     """Agrega al state los campos derivados que consume la GUI."""
     # El ciclo ya dejo los timestamps (last_grant_ok, etc). Aqui agregamos
     # el estado 'fresco' del probe para que la GUI pinte en verde/rojo.
-    st, _ = core.probe()
+    if action in _ONLINE_ACTIONS:
+        # el ciclo ya verifico online (verify_online o probe==online)
+        st = "online"
+    else:
+        st, _ = core.probe()
     state["probe"] = st
     state["online"] = st == "online"
     state["last_action"] = action
@@ -86,9 +94,12 @@ def run(poll=None):
                 log.info("ciclo: %s", action)
         except Exception as e:
             log.exception("ciclo exception: %s", e)
+        # Poll adaptativo: sonda rapida (5s) mientras la red no esta online;
+        # poll largo (20s) solo cuando el ultimo ciclo quedo online.
+        poll_eff = core.POLL_SECONDS if state.get("online") else core.POLL_DOWN_SECONDS
         # duerme en cortos para reaccionar rapido a la senal de parada
         slept = 0.0
-        while slept < poll and not stopping["flag"]:
+        while slept < poll_eff and not stopping["flag"]:
             time.sleep(0.5)
             slept += 0.5
 
