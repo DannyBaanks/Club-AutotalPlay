@@ -1,0 +1,70 @@
+name: Linux AppImage
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+# Igual que windows-exe.yml: push solo en master para no duplicar runs en PRs.
+concurrency:
+  group: linux-appimage-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write   # para subir el AppImage a un Release (solo aplica con tag)
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar squashfs-tools + FUSE (para correr el AppImage)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y squashfs-tools libfuse2t64
+
+      - name: Descargar runtime oficial AppImageKit (Type2, x86_64)
+        run: |
+          curl -fsSL -o "$HOME/runtime-x86_64" \
+            https://github.com/AppImage/AppImageKit/releases/download/continuous/runtime-x86_64
+          chmod +x "$HOME/runtime-x86_64"
+
+      - name: Venv + paquete + pyinstaller + deps de bandeja
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -e '.[gui]'
+          .venv/bin/pip install pyinstaller
+
+      - name: Smoke test CLI (antes de empaquetar)
+        run: .venv/bin/python -m club_autotalplay.cli --help
+
+      - name: Build AppImage
+        run: RUNTIME="$HOME/runtime-x86_64" ./packaging/build_appimage.sh
+
+      - name: Smoke test AppImage (status)
+        run: |
+          ls -la dist/
+          ./dist/Club-AutotalPlay-x86_64.AppImage status
+
+      - name: Subir a Release (si hay tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            dist/Club-AutotalPlay-x86_64.AppImage \
+            --clobber
+
+      - name: Guardar artifact (siempre)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Club-AutotalPlay-linux-x86_64
+          path: dist/Club-AutotalPlay-x86_64.AppImage

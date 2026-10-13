@@ -167,8 +167,10 @@ pyinstaller --noconfirm --clean --onefile --windowed --name Club-AutotalPlayTray
   packaging/tray_entry.py
 ```
 
-> El CI (`.github/workflows/windows-exe.yml`) hace exactamente esto y sube
-> ambos `.exe` al Release cuando hay tag.
+> El CI construye ambas plataformas en cada push/PR:
+> `.github/workflows/windows-exe.yml` (los dos `.exe`) y
+> `.github/workflows/linux-appimage.yml` (el AppImage). Al haber tag, ambos
+> suben sus artefactos al Release.
 
 ## Requisitos
 
@@ -187,6 +189,74 @@ GET  http://connectivitycheck.gstatic.com/generate_204
 POST https://clubwifi.totalplay.com.mx/ClubMovil/video-completado
      {"ip":…, "mac":…, "nombreAcc":…, "tipo":"DESKTOP"}
   → 204 No Content   (sesión otorgada)
+```
+
+## Pruebas e2e en Linux
+
+Todo lo de esta sección se capturó en Ubuntu 24.04 (GNOME, X11) contra la red
+`Club_Totalplay_WiFi`, con el servicio systemd user corriendo el código del
+repo. Los valores de red (IP / MAC / `accname`) van enmascarados.
+
+### 1. Un corte real: detección → bounce → grant → 204 → restaurado
+
+La sesión expiró y el daemon lo detectó solo. Salida literal del log
+(`journalctl --user -u club-autotalplay`):
+
+```
+19:02:09 WARNING probe=down location=None fail_streak=1
+19:02:10 INFO    re-boteando WiFi: nmcli radio wifi off/on
+19:02:27 INFO    WiFi OK (radio re-botado y reconnectado)
+19:02:33 INFO    grant POST -> HTTP 204 No Content body=b''
+                                     params={'ip': '10.x.x.x', 'mac': 'xx-xx-xx-xx-xx-xx',
+                                             'nombreAcc': '<ACC>', 'tipo': 'DESKTOP'}
+19:02:33 INFO    SESION OTORGADA
+19:02:33 INFO    internet restaurado tras bounce de WiFi
+19:02:34 INFO    ciclo: bounced
+```
+
+**Detección → recuperado en ~24 segundos.** El mismo corte, antes de los
+fixes de sonda rápida / `fail_streak` / grant post-bounce, tardaba ~3.5
+minutos (y a veces quedaba atascado hasta un toggle manual del WiFi).
+
+### 2. Detección sin sondeo lento
+
+El poll es adaptativo: **5 s** mientras la red no está online, **20 s** cuando
+lo está. Cualquier corte se detecta en el siguiente ciclo (~5 s), no en 20.
+
+### 3. Escalamiento a reinicio total (`fail_streak`)
+
+Si **5 ciclos seguidos** quedan sin online (`FAIL_STREAK_ESCALATE`), el
+daemon ignora ambos cooldowns (grant y bounce) y fuerza un reinicio completo
+de la sesión + radio de inmediato — la red de seguridad contra caídas que el
+bounce solo no alcanza a sanar.
+
+### 4. Servicio systemd user + tray
+
+```
+$ systemctl --user status club-autotalplay
+● club-autotalplay.service - Club-AutotalPlay auto-reconnect
+   Active: active (running)
+
+$ ./Club-AutotalPlay-x86_64.AppImage install   # reversible
+```
+
+`install` crea el servicio user y desactiva el watchdog viejo
+(`clubwifi-watchdog`) como respaldo; `uninstall` lo restaura. El icono de la
+bandeja cambia 🟢/🟠/🔴 según el `state.json` que escribe el daemon.
+
+### Cómo reproducir el e2e (Linux)
+
+```bash
+# 1. deja el servicio corriendo
+./Club-AutotalPlay-x86_64.AppImage install
+journalctl --user -u club-autotalplay -f
+
+# 2. espera a que expire la sesión (~15 min) y revisa el log:
+#    Debes ver: probe=down/captive -> bounce/grant -> HTTP 204 -> SESION OTORGADA
+
+# 3. diagnostico puntual
+./Club-AutotalPlay-x86_64.AppImage status --live
+./Club-AutotalPlay-x86_64.AppImage once
 ```
 
 ## Pruebas e2e en Windows
