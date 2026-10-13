@@ -319,6 +319,63 @@ def test_wifi_device_cachea(monkeypatch):
     core.DEV = None
 
 
+def test_current_ssid_radio_desactivado_se_considera_sin_asociacion(monkeypatch):
+    """Radio apagado confirma que no hay otra red y permite recuperarlo."""
+    monkeypatch.setattr(core, "IS_WINDOWS", False)
+    monkeypatch.setattr(core, "wifi_device", lambda: "wlo1")
+
+    def fake_run(cmd, timeout=15):
+        class R:
+            def __init__(self, returncode, stdout="", stderr=""):
+                self.returncode = returncode
+                self.stdout = stdout
+                self.stderr = stderr
+
+        if cmd == ["nmcli", "-t", "-f", "GENERAL.CONNECTION", "dev", "show", "wlo1"]:
+            return R(8, stderr="Device unavailable while Wi-Fi radio is disabled")
+        if cmd == ["nmcli", "radio", "wifi"]:
+            return R(0, stdout="disabled\n")
+        raise AssertionError(f"comando inesperado: {cmd}")
+
+    monkeypatch.setattr(core, "_run", fake_run)
+    assert core.current_ssid() == ""
+
+
+def test_current_ssid_radio_desactivado_aun_si_nmcli_no_da_interfaz(monkeypatch):
+    """La radio desactivada puede ocultar temporalmente el dispositivo Wi-Fi."""
+    monkeypatch.setattr(core, "IS_WINDOWS", False)
+    monkeypatch.setattr(core, "wifi_device", lambda: None)
+
+    def fake_run(cmd, timeout=15):
+        assert cmd == ["nmcli", "radio", "wifi"]
+        class R: returncode, stdout = 0, "disabled\n"
+        return R()
+
+    monkeypatch.setattr(core, "_run", fake_run)
+    assert core.current_ssid() == ""
+
+
+def test_current_ssid_radio_desactivado_con_perfil_vacio(monkeypatch):
+    """Un GENERAL.CONNECTION vacío también queda desambiguado por la radio."""
+    monkeypatch.setattr(core, "IS_WINDOWS", False)
+    monkeypatch.setattr(core, "wifi_device", lambda: "wlo1")
+
+    def fake_run(cmd, timeout=15):
+        class R:
+            def __init__(self, returncode, stdout=""):
+                self.returncode = returncode
+                self.stdout = stdout
+
+        if cmd == ["nmcli", "-t", "-f", "GENERAL.CONNECTION", "dev", "show", "wlo1"]:
+            return R(0, "GENERAL.CONNECTION:\n")
+        if cmd == ["nmcli", "radio", "wifi"]:
+            return R(0, "disabled\n")
+        raise AssertionError(f"comando inesperado: {cmd}")
+
+    monkeypatch.setattr(core, "_run", fake_run)
+    assert core.current_ssid() == ""
+
+
 # ---------------------------------------------------------------------------
 # autocaptura pasiva y redactada
 # ---------------------------------------------------------------------------

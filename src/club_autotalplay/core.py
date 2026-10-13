@@ -367,6 +367,15 @@ def wifi_connected():
         return False
 
 
+def _wifi_radio_is_disabled():
+    """True solo cuando NetworkManager confirma que el radio esta apagado."""
+    try:
+        r = _run(["nmcli", "radio", "wifi"])
+        return r.returncode == 0 and (r.stdout or "").strip().lower() == "disabled"
+    except Exception:
+        return False
+
+
 def current_ssid():
     """SSID REAL de la red WiFi conectada (no el nombre del perfil de NM).
 
@@ -391,20 +400,24 @@ def current_ssid():
         return ""
     dev = wifi_device()
     if not dev:
-        return None
+        # Algunas versiones/estados de NetworkManager ocultan la interfaz
+        # mientras el radio esta apagado. Eso confirma que no hay otra red.
+        return "" if _wifi_radio_is_disabled() else None
     try:
         r = _run(
             ["nmcli", "-t", "-f", "GENERAL.CONNECTION", "dev", "show", dev]
         )
         if r.returncode != 0:
-            return None
+            # Con radio desactivado, dev show puede fallar aunque nmcli siga
+            # confirmando que no hay una asociacion Wi-Fi que proteger.
+            return "" if _wifi_radio_is_disabled() else None
         profile = r.stdout.split(":", 1)[-1].strip()
     except Exception:
         return None
     if profile == "--":
         return ""  # sin conexion activa
     if not profile:
-        return None
+        return "" if _wifi_radio_is_disabled() else None
     # el perfil puede estar renombrado: pedir el SSID que tiene configurado
     try:
         r = _run(["nmcli", "-g", "802-11-wireless.ssid", "connection", "show", profile])
