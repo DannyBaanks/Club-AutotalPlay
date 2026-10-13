@@ -158,10 +158,12 @@ pyinstaller --noconfirm --clean --onefile --name Club-AutotalPlay `
   packaging/console_entry.py
 
 # 2) .exe de bandeja (windowed; el ; es el separador de --add-data en Windows)
+#    Sin --specpath: PyInstaller resuelve el --add-data contra el .spec, y si
+#    el .spec vive en build/ la ruta relativa "src/..." no existiria ahi.
 pyinstaller --noconfirm --clean --onefile --windowed --name Club-AutotalPlayTray `
   --add-data "src/club_autotalplay/assets;club_autotalplay/assets" `
   --hidden-import pystray._win32 --collect-all pystray --collect-all PIL `
-  --distpath dist --workpath build/pyi-work-tray --specpath build --paths src `
+  --distpath dist --workpath build/pyi-work-tray --paths src `
   packaging/tray_entry.py
 ```
 

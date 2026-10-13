@@ -37,11 +37,14 @@ jobs:
           packaging/console_entry.py
 
       # 2) .exe de bandeja: windowed, con pystray (win32) + Pillow + iconos
+      # El --add-data va con ruta ABSOLUTA: --specpath build hace que
+      # PyInstaller resuelva las rutas relativas contra build/ y no contra el
+      # cwd, asi que "src/..." no existiria ahi.
       - name: Build .exe de bandeja (windowed, onefile)
         run: >
           pyinstaller --noconfirm --clean --onefile --windowed
           --name Club-AutotalPlayTray
-          --add-data "src/club_autotalplay/assets;club_autotalplay/assets"
+          --add-data "${{ github.workspace }}\src\club_autotalplay\assets;club_autotalplay/assets"
           --hidden-import pystray._win32
           --collect-all pystray --collect-all PIL
           --distpath dist --workpath build/pyi-work-tray --specpath build
