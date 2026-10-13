@@ -3,10 +3,19 @@ name: Windows .exe
 on:
   push:
     branches: [master]
+  pull_request:
+    branches: [master]
   workflow_dispatch:
 
+# push solo esta en master: un push a la rama del PR NO dispara por push,
+# asi que nunca salen dos runs. cancel-in-progress evita carreras si hay
+# varios commits seguidos.
+concurrency:
+  group: windows-exe-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
-  contents: write   # para subir los .exe a un Release
+  contents: write   # para subir los .exe a un Release (solo aplica con tag)
 
 jobs:
   build:
