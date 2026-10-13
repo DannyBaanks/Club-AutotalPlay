@@ -132,6 +132,11 @@ POST https://clubwifi.totalplay.com.mx/ClubMovil/video-completado
 3. Manda el `POST` → `204` = sesión otorgada.
 4. Si no basta, re-botea el WiFi (`nmcli` en Linux, `netsh` en Windows).
 
+> **Aviso:** el `204` prueba que el servidor acepta la solicitud; no prueba que
+> automatizarlo de forma indefinida esté permitido por los Términos de
+> Totalplay. Verificalo con el proveedor antes de depender de la app o
+> recomendarla. Uso bajo tu responsabilidad.
+
 ---
 
 ## Trampas

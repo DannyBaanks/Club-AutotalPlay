@@ -364,6 +364,18 @@ Club-AutotalPlay.exe run
 Club-AutotalPlay.exe debug
 ```
 
+## Aviso / Disclaimer
+
+La respuesta `204` del portal demuestra que el servidor acepta la solicitud;
+**no demuestra por sí sola que automatizar ese procedimiento de forma
+indefinida esté permitido por los Términos y Condiciones de Totalplay**.
+
+Este proyecto es una herramienta personal de conveniencia, publicada para que
+otros la prueben bajo su propio criterio. Antes de depender de ella o
+recomendarla públicamente, verifica con el proveedor que el uso automatizado
+del portal es consistente con sus condiciones del servicio. El uso queda bajo
+responsabilidad de quien la ejecuta.
+
 ## Licencia
 
 MIT
