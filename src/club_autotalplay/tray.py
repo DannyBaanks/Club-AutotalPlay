@@ -14,7 +14,6 @@ pystray usa AppIndicator/ayatana si esta disponible).
 from __future__ import annotations
 
 import logging
-import os
 import threading
 import time
 
@@ -77,15 +76,11 @@ class TrayApp:
                 age = None
             if age is None or age > core.POLL_SECONDS * 3:
                 return False  # estado viejo: el pid no sirve
-        try:
-            os.kill(int(pid), 0)   # 0 = solo sondear; no envia senal
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True            # vivo pero de otro usuario
-        except Exception:
-            return False
+        # NO usar os.kill(pid, 0) aqui: en Windows eso NO sondea, llama a
+        # TerminateProcess y MATARIA al daemon en vez de preguntar si vive
+        # (verificado: victim murio con rc=0xC000013A). daemon._pid_alive usa
+        # OpenProcess/GetExitCodeProcess en Windows y kill(pid,0) en POSIX.
+        return daemon._pid_alive(pid)
 
     # --- threads -----------------------------------------------------------
     def _daemon_thread(self):

@@ -20,7 +20,12 @@ UNIT_DIR = os.path.expanduser("~/.config/systemd/user")
 
 
 def _run(cmd, check=False):
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    kwargs = {}
+    if core.IS_WINDOWS:
+        # CREATE_NO_WINDOW: evita que powershell/systemctl abran consola
+        # visible si el padre es windowed (la bandeja).
+        kwargs["creationflags"] = 0x08000000
+    r = subprocess.run(cmd, capture_output=True, text=True, **kwargs)
     if check and r.returncode != 0:
         raise RuntimeError(f"{' '.join(cmd)} fallo rc={r.returncode}: {r.stderr.strip()}")
     return r
@@ -52,7 +57,95 @@ def _is_active(unit):
     return _run(["systemctl", "--user", "is-active", unit]).returncode == 0
 
 
+# --- Windows: autostart via acceso directo en la carpeta de inicio ---------
+# No hay systemd en Windows. El equivalente user-friendly es un .lnk en
+# `shell:startup`: es visible en Administrador de tareas > Apps de inicio,
+# el usuario puede desactivarlo, y no requiere privilegios.
+
+
+def _startup_dir():
+    return os.path.join(
+        os.environ.get("APPDATA") or os.path.expanduser("~"),
+        "Microsoft", "Windows", "Start Menu", "Programs", "Startup",
+    )
+
+
+def _win_shortcut_path():
+    return os.path.join(_startup_dir(), "Club-AutotalPlay.lnk")
+
+
+def _win_autostart_target():
+    """(target, args) para el .lnk.
+
+    Si el .exe congelado es el de bandeja, apunta a el sin args.
+    Si se corrio desde el .exe de consola, busca el .exe de bandeja junto a
+    el (mismo folder de distribucion); si no esta, usa el actual pero con el
+    subcomando `tray` para que arranque la app completa igual.
+    """
+    if getattr(sys, "frozen", False):
+        here = os.path.dirname(sys.executable)
+        tray = os.path.join(here, "Club-AutotalPlayTray.exe")
+        if os.path.exists(tray):
+            return tray, ""
+        # solo hay el .exe de consola: lanzarlo sin args solo imprime la ayuda
+        return sys.executable, "tray"
+    # desarrollo: python -m club_autotalplay.cli tray
+    return sys.executable, "-m club_autotalplay.cli tray"
+
+
+def _ps_quote(s):
+    """Comilla para PowerShell (single-quote; ' se duplica)."""
+    return "'" + s.replace("'", "''") + "'"
+
+
+def _win_create_shortcut():
+    target, args = _win_autostart_target()
+    lnk = _win_shortcut_path()
+    workdir = os.path.dirname(target)
+    ps = (
+        "$s = (New-Object -ComObject WScript.Shell).CreateShortcut("
+        + _ps_quote(lnk) + "); "
+        "$s.TargetPath = " + _ps_quote(target) + "; "
+        "$s.Arguments = " + _ps_quote(args) + "; "
+        "$s.WorkingDirectory = " + _ps_quote(workdir) + "; "
+        "$s.Save()"
+    )
+    return _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps])
+
+
+def _win_install():
+    print("== instalando autostart (Windows) ==")
+    target, args = _win_autostart_target()
+    print(f"  target : {target}")
+    print(f"  args   : {args or '(ninguno)'}")
+    print(f"  lnk    : {_win_shortcut_path()}")
+    r = _win_create_shortcut()
+    if r.returncode != 0:
+        print(f"  ERROR: powershell rc={r.returncode}: {r.stderr.strip()}", file=sys.stderr)
+        return 1
+    if not os.path.exists(_win_shortcut_path()):
+        print("  ERROR: el acceso directo no quedo creado", file=sys.stderr)
+        return 1
+    print("  OK: la app (bandeja + daemon) arrancara al iniciar sesion")
+    print("  para probarlo ahora: cierra la app y vuelve a abrirla, o reinicia")
+    return 0
+
+
+def _win_uninstall():
+    print("== desinstalando autostart (Windows) ==")
+    lnk = _win_shortcut_path()
+    try:
+        os.remove(lnk)
+        print(f"  eliminado: {lnk}")
+    except FileNotFoundError:
+        print("  (no habia acceso directo; nada que hacer)")
+    print("  listo: ya no arrancara sola al iniciar sesion")
+    return 0
+
+
 def install():
+    if core.IS_WINDOWS:
+        return _win_install()
     print(f"== instalando {NEW_UNIT} ==")
 
     # 1. escribir la unit del core nuevo
@@ -92,6 +185,8 @@ def install():
 
 
 def uninstall():
+    if core.IS_WINDOWS:
+        return _win_uninstall()
     print(f"== desinstalando {NEW_UNIT} ==")
 
     _run(["systemctl", "--user", "disable", "--now", NEW_UNIT])

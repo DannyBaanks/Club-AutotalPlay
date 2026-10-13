@@ -105,3 +105,38 @@ def run(poll=None):
 
     log.info("daemon detenido")
     return 0
+
+
+def _pid_alive(pid):
+    """True si el pid sigue vivo (Windows via ctypes; POSIX via kill 0)."""
+    if not pid:
+        return False
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if core.IS_WINDOWS:
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                return False
+            code = ctypes.c_ulong()
+            ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
+            k32.CloseHandle(h)
+            return bool(ok) and code.value == STILL_ACTIVE
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def is_running():
+    """True si ya hay un daemon vivo publicando estado (evita doble-daemon)."""
+    return _pid_alive(core.load_state().get("pid"))

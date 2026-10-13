@@ -3,10 +3,19 @@ name: Windows .exe
 on:
   push:
     branches: [master]
+  pull_request:
+    branches: [master]
   workflow_dispatch:
 
+# push solo esta en master: un push a la rama del PR NO dispara por push,
+# asi que nunca salen dos runs. cancel-in-progress evita carreras si hay
+# varios commits seguidos.
+concurrency:
+  group: windows-exe-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
-  contents: write   # para subir el .exe a un Release
+  contents: write   # para subir los .exe a un Release (solo aplica con tag)
 
 jobs:
   build:
@@ -18,23 +27,50 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Instalar paquete + pyinstaller
+      - name: Instalar paquete + pyinstaller + deps de bandeja
         run: |
           python -m pip install --upgrade pip
           pip install -e .
-          pip install pyinstaller
+          pip install pyinstaller pystray Pillow
 
       - name: Smoke test CLI (antes de empaquetar)
         run: python -m club_autotalplay.cli --help
 
-      - name: Build .exe (onefile, consola)
+      # 1) .exe de consola: CLI (status/once/run/debug/install/uninstall)
+      - name: Build .exe de consola (onefile)
         run: >
           pyinstaller --noconfirm --clean --onefile
           --name Club-AutotalPlay
+          --distpath dist --workpath build/pyi-work --specpath build
+          --paths src
           packaging/console_entry.py
 
-      - name: Smoke test .exe
+      # 2) .exe de bandeja: windowed, con pystray (win32) + Pillow + iconos
+      # El --add-data va con ruta ABSOLUTA: --specpath build hace que
+      # PyInstaller resuelva las rutas relativas contra build/ y no contra el
+      # cwd, asi que "src/..." no existiria ahi.
+      - name: Build .exe de bandeja (windowed, onefile)
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name Club-AutotalPlayTray
+          --add-data "${{ github.workspace }}\src\club_autotalplay\assets;club_autotalplay/assets"
+          --hidden-import pystray._win32
+          --collect-all pystray --collect-all PIL
+          --distpath dist --workpath build/pyi-work-tray --specpath build
+          --paths src
+          packaging/tray_entry.py
+
+      - name: Smoke test .exe de consola
         run: dist\Club-AutotalPlay.exe --help
+
+      # El de bandeja es windowed: lanzarlo sin args BLOCK (corre el loop del
+      # tray), asi que solo verificamos que exista.
+      - name: Smoke test .exe de bandeja (existe)
+        shell: pwsh
+        run: |
+          if (-not (Test-Path dist/Club-AutotalPlayTray.exe)) { throw "falta el .exe de bandeja" }
+          Get-Item dist/Club-AutotalPlay.exe, dist/Club-AutotalPlayTray.exe |
+            Select-Object Name, Length
 
       - name: Subir a Release (si hay tag)
         if: startsWith(github.ref, 'refs/tags/')
@@ -43,10 +79,13 @@ jobs:
         run: |
           gh release upload "${{ github.ref_name }}" `
             dist/Club-AutotalPlay.exe `
+            dist/Club-AutotalPlayTray.exe `
             --clobber
 
       - name: Guardar artifact (siempre)
         uses: actions/upload-artifact@v4
         with:
           name: Club-AutotalPlay-windows-x64
-          path: dist/Club-AutotalPlay.exe
+          path: |
+            dist/Club-AutotalPlay.exe
+            dist/Club-AutotalPlayTray.exe

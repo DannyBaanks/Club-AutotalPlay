@@ -19,6 +19,19 @@ import sys
 from . import core, daemon
 
 
+def _force_utf8():
+    """Windows mojibakea acentos/em-dash en la consola; forzamos UTF-8.
+
+    Sin esto, el volcado de `debug` sale ilegible justamente donde mas se
+    necesita (el Location del portal, los headers).
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def _cmd_run(args):
     return daemon.run(poll=args.poll)
 
@@ -95,7 +108,15 @@ def _cmd_gui(args):
     return 0
 
 
+def _cmd_debug(args):
+    """Vuelca el estado crudo de probe/portal/grant para capturar un corte."""
+    core.setup_logging(to_stdout=False)
+    print(core.debug_dump(perform_grant=not args.dry))
+    return 0
+
+
 def main(argv=None):
+    _force_utf8()
     ap = argparse.ArgumentParser(
         prog="club-autotalplay",
         description="Auto-reconnect para la red Club_Totalplay_WiFi",
@@ -114,6 +135,11 @@ def main(argv=None):
     p_status.add_argument("--live", action="store_true",
                           help="fuerza un probe real de la red")
     p_status.set_defaults(func=_cmd_status)
+
+    p_dbg = sub.add_parser("debug", help="diagnostico crudo (probe+portal+grant) para capturar un corte")
+    p_dbg.add_argument("--dry", action="store_true",
+                       help="solo probe; no hace GET ni POST al portal")
+    p_dbg.set_defaults(func=_cmd_debug)
 
     p_inst = sub.add_parser("install", help="instala el servicio systemd user (M4)")
     p_inst.set_defaults(func=_cmd_install)
