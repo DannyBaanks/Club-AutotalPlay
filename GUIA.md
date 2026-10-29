@@ -131,7 +131,8 @@ POST https://clubwifi.totalplay.com.mx/ClubMovil/video-completado
   → 204 No Content   (sesión otorgada)
 ```
 
-1. Cada ~20 s sondea el probe de arriba.
+1. Cada ~20 s sondea el probe de arriba (cada 1 s cerca del minuto 15, cuando
+   el portal corta la sesión).
 2. Si responde `302` (hubo corte), parsea IP / MAC / `accname` del `Location`.
 3. Manda el `POST` → `204` = sesión otorgada.
 4. Si no basta, re-botea el WiFi (`nmcli` en Linux, `netsh` en Windows).
@@ -142,6 +143,40 @@ POST https://clubwifi.totalplay.com.mx/ClubMovil/video-completado
 > recomendarla. Uso bajo tu responsabilidad.
 
 ---
+
+## Seguridad en red pública
+
+`Club_Totalplay_WiFi` es una red **abierta**: el tráfico entre tu equipo y el
+AP no va cifrado y cualquiera conectado puede intentar hablarle a tu máquina.
+
+**Lo que hace la app para no ser el eslabón débil:**
+
+- **Solo confía en el portal real.** El sondeo de captive viaja por HTTP plano
+  (así funciona en todos los sistemas), y alguien en la red puede falsificar
+  ese `302`. La app solo acepta redirects a `https://clubwifi.totalplay.com.mx`;
+  cualquier otro host se ignora (`foreign-portal`): no extrae datos, no hace
+  `POST` y **no re-botea el radio**. Así nadie puede hacerte flapear el WiFi
+  con redirects falsos.
+- **Valida lo que manda.** IP privada IPv4, MAC bien formada y zona sin
+  caracteres de control; lo demás no sale de tu equipo.
+- **El `POST` va por HTTPS con certificado verificado**, directo al host fijo
+  del portal (no al que diga el redirect).
+- **Datos locales cerrados.** El directorio de estado queda `0700` y
+  `state.json` `0600` (Linux). Logs y `status` enmascaran IP, MAC y zona.
+- **Nunca toca otra red.** Si estás en otro WiFi, o no se puede saber en cuál,
+  no hace nada.
+
+**Lo que la app NO puede hacer por ti** (recomendado al usar esta red):
+
+- **Firewall activo, entrada denegada.** Ubuntu: `sudo ufw enable` y revisa con
+  `sudo ufw status verbose` que diga `deny (incoming)`. Windows: perfil de red
+  **Pública** (Configuración → Red → Propiedades).
+- **No expongas servicios en `0.0.0.0`** (servidores de desarrollo, SSH con
+  contraseña). Revisa con `ss -tulnp` (Linux) o `netstat -ano` (Windows).
+- **Solo HTTPS**, o una VPN (Tailscale/WireGuard) para lo sensible.
+- Un AP falso con el mismo SSID es indistinguible en una red abierta: la app
+  no le entrega nada útil (el `POST` exige el certificado del portal real),
+  pero tu demás tráfico sí pasa por él. Por eso lo de arriba.
 
 ## Trampas
 

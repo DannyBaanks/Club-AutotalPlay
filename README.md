@@ -7,6 +7,7 @@
 Icono en la bandeja · reconexión sola · sin browser ni video.
 
 [![Linux](https://img.shields.io/badge/platform-Linux-blue?logo=linux&logoColor=white)](#)
+[![Windows](https://img.shields.io/badge/platform-Windows-blue?logo=windows&logoColor=white)](#)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue?logo=python&logoColor=white)](#)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](#)
 
@@ -16,16 +17,20 @@ Icono en la bandeja · reconexión sola · sin browser ni video.
 
 ## ¿Qué hace?
 
-La red de Totalplay otorga sesiones de ~15 minutos. Cuando expira, **corta el
+La red de Totalplay otorga sesiones de ~15 minutos (900 s exactos, medido en
+15 días de logs). Cuando expira, **corta el
 internet** y redirige todo el tráfico a un portal cautivo que te hace ver un
 video de publicidad. Al terminar, tu navegador manda un `POST` que otorga la
 sesión nueva — y vuelves a tener internet.
 
 **Este proyecto hace ese `POST` automáticamente**, sin browser ni video:
 
-1. Cada ~20 s sondea `http://connectivitycheck.gstatic.com/generate_204`.
+1. Cada ~20 s sondea `http://connectivitycheck.gstatic.com/generate_204` — y
+   **cada 1 s** alrededor del minuto 15 de la sesión, cuando el portal corta.
 2. Si responde `302` (hubo corte), parsea IP / MAC / `accname` del `Location` del portal.
 3. Manda el `POST` a `/ClubMovil/video-completado` → `204` = sesión otorgada.
+   Si el portal corta la respuesta (`IncompleteRead`) pero el sondeo ya da
+   `204`, cuenta como otorgada — sin re-botear el radio.
 4. Si el sondeo se cae del todo pero el WiFi sigue asociado, reintenta ese
    `POST` con los últimos parámetros conocidos — **sin tocar el radio**.
 5. Si ni eso basta, re-botea el WiFi por `nmcli` como último recurso.
@@ -38,8 +43,14 @@ Todo en segundo plano, con un **icono en la bandeja** que cambia de color:
 | 🟠 Ámbar | reconectando |
 | 🔴 Rojo | sin conexión |
 
-> Probado en Ubuntu 24.04 (GNOME, X11). Se desconecta, el icono se pone rojo,
-> renueva la sesión sola y vuelve a verde.
+> Probado en Ubuntu 24.04 (GNOME, X11) y en Windows. Se desconecta, el icono
+> se pone rojo, renueva la sesión sola y vuelve a verde — normalmente en
+> **1-4 segundos**.
+
+**¿Es seguro en una red pública?** La app solo confía en el portal real de
+Totalplay (HTTPS con certificado verificado), ignora redirects falsos y
+guarda sus datos con permisos privados. Ver
+[Seguridad en red pública](#seguridad-en-red-pública).
 
 ## Descargar y probar
 
@@ -198,11 +209,61 @@ POST https://clubwifi.totalplay.com.mx/ClubMovil/video-completado
   → 204 No Content   (sesión otorgada)
 ```
 
+- La sesión dura **~900 s** desde el grant; después el portal vuelve a
+  secuestrar el tráfico.
+- El `POST` muchas veces **no regresa respuesta** (`IncompleteRead` /
+  `Remote end closed`) aunque sí otorgó la sesión: el AP abre el tráfico a
+  medio camino y corta la conexión. Por eso la app re-prueba unos segundos
+  antes de considerarlo fallido.
+- Solo se aceptan redirects a `https://clubwifi.totalplay.com.mx`.
+
 ## Pruebas e2e en Linux
 
 Todo lo de esta sección se capturó en Ubuntu 24.04 (GNOME, X11) contra la red
 `Club_Totalplay_WiFi`, con el servicio systemd user corriendo el código del
 repo. Los valores de red (IP / MAC / `accname`) van enmascarados.
+
+### 0. Lo más reciente: de ~21 s a ~3 s por corte (2026-10-28)
+
+Análisis de `watchdog.log` del 2026-10-13 al 28 (~650 cortes reales) con la
+versión anterior:
+
+| Cómo terminó el corte | Veces | Mediana | p90 |
+|---|---|---|---|
+| grant directo (`granted`) | 279 | 0.9 s | 3.3 s |
+| re-booteo de radio (`bounced`) | 341 | 20.9 s | 42.6 s |
+
+Más de la mitad acababa en bounce, y en **~170** de esos el `POST` "falló"
+sin respuesta, se re-booteó el radio y el internet volvió **sin ningún 204
+posterior**: el grant sí había funcionado. Ahora la app re-prueba antes de
+tocar el radio. Corte real con la versión nueva:
+
+```
+18:40:02 WARNING probe=captive location=https://clubwifi.totalplay.com.mx/ClubMovil/inicio.jsp?...
+18:40:03 INFO    captive portal detectado -> otorgando sesion: {'ip': '10.x.x.x', ...}
+18:40:05 ERROR   grant POST fallo: Remote end closed connection without response
+18:40:05 INFO    grant sin respuesta pero el probe ya da 204: sesion otorgada
+18:40:05 INFO    SESION OTORGADA - internet restaurado
+18:40:05 INFO    ciclo: granted
+```
+
+**Detección → restaurado en 3.4 s, sin bounce** (antes: 20-40 s).
+
+Siguiente corte, ya con el sondeo de 1 s en la ventana de expiración (la
+sesión anterior se otorgó a las 18:40:05; el corte llegó a los 917 s):
+
+```
+18:55:22.522 WARNING probe=captive location=https://clubwifi.totalplay.com.mx/ClubMovil/inicio.jsp?...
+18:55:22.579 INFO    captive portal detectado -> otorgando sesion: {'ip': '10.x.x.x', ...}
+18:55:22.968 ERROR   grant POST fallo: Remote end closed connection without response
+18:55:23.003 INFO    grant sin respuesta pero el probe ya da 204: sesion otorgada
+18:55:23.072 INFO    ciclo: granted
+```
+
+**Detección → restaurado en 0.55 s.** Con sondeo cada 1 s en esa ventana, el
+retraso de detección queda acotado a ~1 s (antes, hasta 20 s; ~10 s en
+promedio). El daemon no registra los probes que dan `online`, así que ese
+retraso se deduce del intervalo, no está medido línea por línea.
 
 ### 1. Un corte real: detección → bounce → grant → 204 → restaurado
 
@@ -228,7 +289,10 @@ minutos (y a veces quedaba atascado hasta un toggle manual del WiFi).
 ### 2. Detección sin sondeo lento
 
 El poll es adaptativo: **5 s** mientras la red no está online, **20 s** cuando
-lo está. Cualquier corte se detecta en el siguiente ciclo (~5 s), no en 20.
+lo está, y **1 s** en la ventana de expiración: el portal corta ~900 s después
+de otorgar la sesión (logs 2026-10-13..28: p10 = 899 s, mediana 906 s), así
+que de los 880 s a los 960 s el daemon sondea cada segundo y el grant sale
+casi en cuanto llega el corte.
 
 ### 3. Escalamiento a reinicio total (`fail_streak`)
 
@@ -370,6 +434,50 @@ Club-AutotalPlay.exe run
 :: 3. diagnostico puntual si algo se desvía
 Club-AutotalPlay.exe debug
 ```
+
+## Seguridad en red pública
+
+`Club_Totalplay_WiFi` es una red **abierta**: el tráfico entre tu equipo y el
+AP no va cifrado y cualquiera conectado puede intentar hablarle a tu máquina.
+
+**Lo que hace la app para no ser el eslabón débil:**
+
+- **Solo confía en el portal real.** El sondeo de captive viaja por HTTP plano
+  (así funciona en todos los sistemas), y alguien en la red puede falsificar
+  ese `302`. La app solo acepta redirects a `https://clubwifi.totalplay.com.mx`;
+  cualquier otro host se ignora (`foreign-portal`): no extrae datos, no hace
+  `POST` y **no re-botea el radio**. Así nadie puede hacerte flapear el WiFi
+  con redirects falsos.
+- **Valida lo que manda.** IP privada IPv4, MAC bien formada y zona sin
+  caracteres de control; lo demás no sale de tu equipo.
+- **El `POST` va por HTTPS con certificado verificado**, directo al host fijo
+  del portal (no al que diga el redirect).
+- **Datos locales cerrados.** El directorio de estado queda `0700` y
+  `state.json` `0600` (Linux). Logs y `status` enmascaran IP, MAC y zona.
+- **Nunca toca otra red.** Si estás en otro WiFi, o no se puede saber en cuál,
+  no hace nada.
+
+**Lo que la app NO puede hacer por ti** (recomendado al usar esta red):
+
+- **Firewall activo, entrada denegada.** Ubuntu: `sudo ufw enable` y revisa con
+  `sudo ufw status verbose` que diga `deny (incoming)`. Windows: perfil de red
+  **Pública** (Configuración → Red → Propiedades).
+- **No expongas servicios en `0.0.0.0`** (servidores de desarrollo, SSH con
+  contraseña). Revisa con `ss -tulnp` (Linux) o `netstat -ano` (Windows).
+- **Solo HTTPS**, o una VPN (Tailscale/WireGuard) para lo sensible.
+- Un AP falso con el mismo SSID es indistinguible en una red abierta: la app
+  no le entrega nada útil (el `POST` exige el certificado del portal real),
+  pero tu demás tráfico sí pasa por él. Por eso lo de arriba.
+
+## Tests
+
+```bash
+.venv/bin/python -m pytest -q        # 62 tests, sin red real
+```
+
+Cada test corre con `STATE_DIR` / `state.json` / `watchdog.log` en un
+directorio temporal (`tests/conftest.py`): la suite nunca toca el estado ni
+el log reales del daemon. El CI los corre en cada push/PR.
 
 ## Aviso / Disclaimer
 

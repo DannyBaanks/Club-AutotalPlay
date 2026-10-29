@@ -437,7 +437,64 @@ def test_grant_session_error(monkeypatch):
         def close(self): pass
 
     monkeypatch.setattr(core.http.client, "HTTPSConnection", FakeConn)
+    monkeypatch.setattr(core, "verify_online", lambda deadline=0, interval=0: False)
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
     assert core.grant_session(PORTAL_PARAMS) is False
+
+
+def test_grant_sin_respuesta_pero_online_cuenta_como_otorgado(monkeypatch):
+    """IncompleteRead con el probe ya en 204 = sesion otorgada, sin reintento ni bounce."""
+    calls = {"post": 0}
+
+    class FakeConn:
+        def __init__(self, *a, **k): pass
+        def request(self, *a, **k):
+            calls["post"] += 1
+            raise core.http.client.IncompleteRead(b"")
+        def close(self): pass
+
+    monkeypatch.setattr(core.http.client, "HTTPSConnection", FakeConn)
+    monkeypatch.setattr(core, "verify_online", lambda deadline=0, interval=0: True)
+    assert core.grant_session(PORTAL_PARAMS) is True
+    assert calls["post"] == 1
+
+
+# ---------------------------------------------------------------------------
+# next_poll_seconds: sondeo rapido solo alrededor de la expiracion (~900 s)
+# ---------------------------------------------------------------------------
+
+def _state_started_ago(seconds):
+    from datetime import datetime, timedelta
+    t = datetime.now().astimezone() - timedelta(seconds=seconds)
+    return {"session_started": t.isoformat(timespec="seconds")}
+
+
+def test_next_poll_red_caida_es_rapido():
+    assert core.next_poll_seconds({}, online=False) == core.POLL_DOWN_SECONDS
+
+
+def test_next_poll_sin_ancla_es_largo():
+    assert core.next_poll_seconds({}, online=True) == core.POLL_SECONDS
+
+
+def test_next_poll_sesion_joven_es_largo():
+    assert core.next_poll_seconds(_state_started_ago(60), online=True) == core.POLL_SECONDS
+
+
+def test_next_poll_despierta_justo_al_abrir_ventana():
+    # faltan ~10 s para abrir la ventana: no dormir los 20 s completos
+    age = core.SESSION_SECONDS - core.EXPIRY_LEAD_SECONDS - 10
+    assert 8 <= core.next_poll_seconds(_state_started_ago(age), online=True) <= 11
+
+
+def test_next_poll_en_ventana_de_expiracion_es_1s():
+    assert core.next_poll_seconds(_state_started_ago(core.SESSION_SECONDS), online=True) \
+        == core.POLL_EXPIRY_SECONDS
+
+
+def test_next_poll_pasada_la_ventana_vuelve_a_largo():
+    age = core.SESSION_SECONDS + core.EXPIRY_TAIL_SECONDS + 5
+    assert core.next_poll_seconds(_state_started_ago(age), online=True) == core.POLL_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -744,6 +801,7 @@ def test_grant_session_reintenta(monkeypatch):
         return calls["n"] == 2  # falla la 1a, acierta la 2a
 
     monkeypatch.setattr(core, "_grant_session_once", once)
+    monkeypatch.setattr(core, "verify_online", lambda deadline=0, interval=0: False)
     monkeypatch.setattr(core.time, "sleep", lambda s: None)
     assert core.grant_session(PORTAL_PARAMS) is True
     assert calls["n"] == 2
@@ -793,3 +851,62 @@ def test_handle_captive_location_mala(monkeypatch):
     monkeypatch.setattr(core, "maybe_autocapture", lambda tag="captive": None)
     state = _fresh_state()
     assert core.handle_captive("https://x/?nada=1", state) is False
+
+
+# ---------------------------------------------------------------------------
+# red publica: solo se confia en el portal real (el 302 viaja por HTTP plano)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("loc", [
+    "http://clubwifi.totalplay.com.mx/ClubMovil/inicio.jsp?wlanuserip=10.0.0.2&wlanparameter=50-2e-91-a1-f8-e4",
+    "https://clubwifi.totalplay.com.mx.evil.mx/ClubMovil/inicio.jsp?wlanuserip=10.0.0.2&wlanparameter=50-2e-91-a1-f8-e4",
+    "https://evil.mx/?u=https://clubwifi.totalplay.com.mx&wlanuserip=10.0.0.2&wlanparameter=50-2e-91-a1-f8-e4",
+    "https://clubwifi.totalplay.com.mx@evil.mx/?wlanuserip=10.0.0.2&wlanparameter=50-2e-91-a1-f8-e4",
+])
+def test_portal_ajeno_no_da_params(loc):
+    assert core.is_trusted_portal(loc) is False
+    assert core.parse_portal_params(loc) is None
+
+
+def test_portal_real_es_confiable():
+    assert core.is_trusted_portal(CAPTIVE_LOC) is True
+
+
+@pytest.mark.parametrize("query", [
+    "wlanuserip=8.8.8.8&wlanparameter=50-2e-91-a1-f8-e4",          # IP publica
+    "wlanuserip=10.0.0.999&wlanparameter=50-2e-91-a1-f8-e4",       # IP invalida
+    "wlanuserip=10.0.0.2&wlanparameter=50-2e-91",                  # MAC corta
+    "wlanuserip=10.0.0.2&wlanparameter=50-2e-91-a1-f8-e4&accname=a%0Ab",  # control char
+])
+def test_params_con_formato_invalido_se_rechazan(query):
+    loc = f"https://{core.GRANT_HOST}/ClubMovil/inicio.jsp?{query}"
+    assert core.parse_portal_params(loc) is None
+
+
+def test_ciclo_portal_ajeno_no_grant_ni_bounce(monkeypatch):
+    """Un 302 spoofeado en la red publica no debe tocar el portal ni el radio."""
+    monkeypatch.setattr(core, "probe", lambda: ("captive", "https://evil.mx/login"))
+    monkeypatch.setattr(core, "current_ssid", lambda: core.SSID)
+
+    def forbidden(*a, **k):
+        raise AssertionError("no debe recuperar ante un portal ajeno")
+
+    monkeypatch.setattr(core, "grant_session", forbidden)
+    monkeypatch.setattr(core, "bring_up_wifi", forbidden)
+    monkeypatch.setattr(core, "save_state", forbidden)
+    state = _fresh_state(fail_streak=core.FAIL_STREAK_ESCALATE)
+    assert core.cycle(state) == "foreign-portal"
+    assert state["fail_streak"] == 0
+    assert "last_portal_params" not in state
+
+
+@pytest.mark.skipif(core.IS_WINDOWS, reason="permisos POSIX")
+def test_dir_de_estado_queda_privado(tmp_path, monkeypatch):
+    d = tmp_path / "abierto"
+    d.mkdir(mode=0o775)
+    d.chmod(0o775)
+    monkeypatch.setattr(core, "STATE_DIR", str(d))
+    monkeypatch.setattr(core, "STATE_PATH", str(d / "state.json"))
+    core.save_state({"x": 1})
+    assert (d.stat().st_mode & 0o777) == 0o700
+    assert ((d / "state.json").stat().st_mode & 0o777) == 0o600

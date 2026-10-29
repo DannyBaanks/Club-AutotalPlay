@@ -17,9 +17,11 @@ Es una libreria: no configura logging al importarse. El CLI/daemon llama a
 from __future__ import annotations
 
 import http.client
+import ipaddress
 import json
 import logging
 import os
+import re
 import socket
 import ssl
 import subprocess
@@ -53,6 +55,11 @@ TIMEOUT = 8                # timeout por request
 COOLDOWN_SECONDS = 45      # no reintentar el grant mas seguido que esto
 WIFI_RETRY_SECONDS = 30    # no re-botear el WiFi mas seguido que esto
 FAIL_STREAK_ESCALATE = 5   # N ciclos sin online -> reinicio total (ignora cooldowns)
+GRANT_RECHECK_SECONDS = 3  # tras un grant sin respuesta, re-probar esto antes de rendirse
+SESSION_SECONDS = 900      # el portal corta ~900 s despues del grant (ver next_poll_seconds)
+EXPIRY_LEAD_SECONDS = 20   # abrir la ventana de sondeo rapido este tanto antes
+EXPIRY_TAIL_SECONDS = 60   # ...y mantenerla este tanto despues
+POLL_EXPIRY_SECONDS = 1    # sondeo dentro de la ventana de expiracion
 
 if IS_WINDOWS:
     _base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
@@ -72,7 +79,7 @@ def setup_logging(level=logging.INFO, to_stdout=True):
     if root.handlers:
         return root
     fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s")
-    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    _private_dir(os.path.dirname(LOG_PATH))
     from logging.handlers import RotatingFileHandler
     fh = RotatingFileHandler(LOG_PATH, maxBytes=512_000, backupCount=3)
     fh.setFormatter(fmt)
@@ -82,6 +89,22 @@ def setup_logging(level=logging.INFO, to_stdout=True):
         sh.setFormatter(fmt)
         root.addHandler(sh)
     return root
+
+
+def _private_dir(path):
+    """Crea el dir de estado y lo deja 0700 en POSIX.
+
+    `makedirs(mode=...)` solo aplica al crear: un dir que ya existia con
+    0775 (instalaciones previas) se queda abierto. Log, state.json (params
+    del portal) y locks viven aqui; con el dir cerrado, los permisos de cada
+    archivo rotado ya no importan.
+    """
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    if not IS_WINDOWS:
+        try:
+            os.chmod(path, 0o700)
+        except OSError as e:
+            log.warning("no pude cerrar permisos de %s: %s", path, e)
 
 
 def now_iso():
@@ -98,7 +121,7 @@ def load_state():
 
 def save_state(state):
     try:
-        os.makedirs(os.path.dirname(STATE_PATH), mode=0o700, exist_ok=True)
+        _private_dir(os.path.dirname(STATE_PATH))
         tmp = STATE_PATH + ".tmp"
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
         if hasattr(os, "O_CLOEXEC"):
@@ -147,9 +170,47 @@ def probe():
         return "down", None
 
 
+def is_trusted_portal(location):
+    """True solo si el redirect apunta al portal real: https://GRANT_HOST.
+
+    El probe viaja por HTTP plano (asi funciona la deteccion de captive), y
+    en una red publica cualquiera en el mismo segmento (o un AP gemelo con el
+    mismo SSID) puede contestar ese 302. Un redirect a otro host no es el
+    portal de Totalplay: no se le extraen params, no se hace grant y no se
+    re-botea el radio por el. En 15 dias de logs (2026-10-13..28) el 100% de
+    los redirects reales fue a https://clubwifi.totalplay.com.mx.
+    """
+    if not location:
+        return False
+    try:
+        parts = urllib.parse.urlparse(location)
+    except Exception:
+        return False
+    return parts.scheme == "https" and (parts.hostname or "").lower() == GRANT_HOST
+
+
+_MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}([-:][0-9A-Fa-f]{2}){5}$")
+
+
+def _valid_params(ip, mac, acc):
+    """Formato estricto: lo que no parece IP/MAC/zona no se manda al portal."""
+    try:
+        addr = ipaddress.IPv4Address(ip)
+    except ValueError:
+        return False
+    if not addr.is_private:
+        return False
+    if not _MAC_RE.match(mac):
+        return False
+    return len(acc) <= 128 and acc.isprintable()
+
+
 def parse_portal_params(location):
     """Extrae ip/mac/nombreAcc de la URL de redirect del portal."""
     if not location:
+        return None
+    if not is_trusted_portal(location):
+        log.warning("redirect a un host que no es el portal: %s", _redact_location(location))
         return None
     try:
         qs = urllib.parse.urlparse(location).query
@@ -158,11 +219,14 @@ def parse_portal_params(location):
         return None
     ip = params.get("wlanuserip") or params.get("ip")
     mac = params.get("wlanparameter") or params.get("mac")
-    acc = params.get("accname") or params.get("nombreAcc") or params.get("wlanacname")
+    acc = params.get("accname") or params.get("nombreAcc") or params.get("wlanacname") or ""
     if not (ip and mac):
         log.warning("params incompletos en location: %s", _redact_location(location))
         return None
-    return {"ip": ip, "mac": mac, "nombreAcc": acc or "", "tipo": "DESKTOP"}
+    if not _valid_params(ip, mac, acc):
+        log.warning("params con formato invalido en location: %s", _redact_location(location))
+        return None
+    return {"ip": ip, "mac": mac, "nombreAcc": acc, "tipo": "DESKTOP"}
 
 
 def _redact_location(location):
@@ -200,9 +264,20 @@ def grant_session(params, retries=1):
     El portal a veces falla intermitentemente (IncompleteRead / Remote end
     closed, visto 2026-10-13 04:02-04:48): se reintenta `retries` veces con
     1 s de separacion antes de declarar fracaso.
+
+    Muchas veces ese "fallo" es un exito: el AP abre el trafico al procesar
+    el POST y corta la respuesta a medio camino. Evidencia (logs
+    2026-10-13..28): ~170 episodios en que ambos intentos dieron
+    IncompleteRead/Remote end closed, se re-boteo el radio y el internet
+    volvio SIN ningun 204 despues. Por eso, tras cada intento fallido se
+    re-prueba unos segundos antes de reintentar (y antes de que el ciclo
+    caiga al bounce de radio, que cuesta ~20-40 s).
     """
     for intento in range(retries + 1):
         if _grant_session_once(params):
+            return True
+        if verify_online(deadline=GRANT_RECHECK_SECONDS, interval=0.5):
+            log.info("grant sin respuesta pero el probe ya da 204: sesion otorgada")
             return True
         if intento < retries:
             log.warning("grant fallo (intento %d/%d); reintentando...", intento + 1, retries + 1)
@@ -477,15 +552,39 @@ def bring_up_wifi():
     return False
 
 
-def verify_online(deadline=45):
+def verify_online(deadline=45, interval=3.0):
     """Repite el probe hasta que sea online o se acabe el tiempo."""
     t0 = time.time()
     while time.time() - t0 < deadline:
         st, _ = probe()
         if st == "online":
             return True
-        time.sleep(3)
+        time.sleep(interval)
     return False
+
+
+def next_poll_seconds(state, online):
+    """Segundos hasta el proximo probe.
+
+    El portal corta la sesion ~900 s despues de otorgarla (logs 2026-10-13..28:
+    p10=899 s, mediana 906 s incluyendo hasta 20 s de lag de sondeo). Con poll
+    fijo de 20 s el corte se detectaba ~10 s tarde en promedio; dentro de la
+    ventana de expiracion se sondea cada segundo y el grant sale casi al
+    instante. Fuera de ella se mantiene el poll largo (red sana) o el rapido
+    (red caida).
+    """
+    if not online:
+        return POLL_DOWN_SECONDS
+    started = _iso_to_epoch(state.get("session_started") or "")
+    if started:
+        age = time.time() - started
+        if SESSION_SECONDS - EXPIRY_LEAD_SECONDS <= age < SESSION_SECONDS + EXPIRY_TAIL_SECONDS:
+            return POLL_EXPIRY_SECONDS
+        if age < SESSION_SECONDS - EXPIRY_LEAD_SECONDS:
+            # no dormir de mas: despertar justo al abrir la ventana
+            return max(POLL_EXPIRY_SECONDS,
+                       min(POLL_SECONDS, SESSION_SECONDS - EXPIRY_LEAD_SECONDS - age))
+    return POLL_SECONDS
 
 
 def handle_captive(location, state):
@@ -554,6 +653,17 @@ def cycle(state):
             st, cur, SSID,
         )
         return "other-network"
+
+    # Guard de portal ajeno: un 302 a otro host (spoofeado en la red publica,
+    # o un AP gemelo) no dispara grant ni bounce. Sin esto, cualquiera en el
+    # segmento podia hacer flapear el radio cada WIFI_RETRY_SECONDS.
+    if st == "captive" and not is_trusted_portal(location):
+        state["fail_streak"] = 0
+        log.warning(
+            "probe=captive hacia un host que no es el portal (%s); no toco nada",
+            _redact_location(location),
+        )
+        return "foreign-portal"
 
     state["fail_streak"] = int(state.get("fail_streak") or 0) + 1
     streak = state["fail_streak"]
@@ -727,7 +837,9 @@ def debug_dump(perform_grant=True, redact=False):
     p("parsed_params", json.dumps(_redact_params(params) if redact else params) if params else "-")
 
     # --- hipotesis B: GET previo a la pagina del portal ------------------
-    if loc and perform_grant:
+    # Solo si el redirect es el portal real: no seguir URLs arbitrarias que
+    # un tercero haya inyectado en el 302 de HTTP plano.
+    if loc and params and perform_grant:
         try:
             g = urllib.request.Request(loc, headers={"User-Agent": USER_AGENT})
             gr = urllib.request.build_opener().open(g, timeout=TIMEOUT)

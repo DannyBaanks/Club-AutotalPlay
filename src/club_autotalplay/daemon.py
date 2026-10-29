@@ -169,6 +169,8 @@ def _cycle_lock(timeout=LOCK_TIMEOUT):
 
 # Acciones del ciclo que ya garantizan online verificado (sin re-probar).
 _ONLINE_ACTIONS = ("online", "granted", "granted-cached", "granted-after-bounce", "bounced")
+# Acciones que restauraron una sesion (no "online" a secas).
+_RESTORED_ACTIONS = _ONLINE_ACTIONS[1:]
 
 
 def _refresh_state(state, action):
@@ -180,6 +182,9 @@ def _refresh_state(state, action):
         st = "online"
     else:
         st, _ = core.probe()
+    if action in _RESTORED_ACTIONS:
+        # sesion nueva del portal: ancla la ventana de expiracion (~900 s)
+        state["session_started"] = core.now_iso()
     state["probe"] = st
     state["online"] = st == "online"
     state["last_action"] = action
@@ -249,19 +254,22 @@ def run(poll=None):
                 # Estado FRESCO del disco en cada ciclo: si otro proceso
                 # escribio state.json entre ciclos (un run_once manual), no
                 # lo pisamos con un dict viejo en memoria.
-                action = run_once()
+                state = core.load_state()
+                action = run_once(state)
                 if action != "online":
                     log.info("ciclo: %s", action)
             except Exception as e:
                 log.exception("ciclo exception: %s", e)
-            # Poll adaptativo: sonda rapida (5s) mientras la red no esta online;
-            # poll largo (20s) solo cuando el ultimo ciclo quedo online.
-            poll_eff = core.POLL_SECONDS if action in _ONLINE_ACTIONS else core.POLL_DOWN_SECONDS
+                state = {}
+            # Poll adaptativo: rapido (5s) con la red caida, 1s en la ventana
+            # de expiracion de la sesion, largo (20s) el resto del tiempo.
+            poll_eff = core.next_poll_seconds(state, action in _ONLINE_ACTIONS)
             # duerme en cortos para reaccionar rapido a la senal de parada
             slept = 0.0
             while slept < poll_eff and not stopping["flag"]:
-                time.sleep(0.5)
-                slept += 0.5
+                step = min(0.5, poll_eff - slept)
+                time.sleep(step)
+                slept += step
     finally:
         try:
             lock_fh.close()  # libera el lock de vida
