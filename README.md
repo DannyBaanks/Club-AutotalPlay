@@ -55,7 +55,7 @@ guarda sus datos con permisos privados. Ver
 > [!IMPORTANT]
 > **Activa el firewall de tu equipo antes de usar esta red.** `Club_Totalplay_WiFi`
 > es abierta: cualquiera conectado puede mandarle paquetes a tu computadora.
-> La app no puede protegerte de eso; el firewall sí.
+> La app no puede protegerte de eso; un firewall bien configurado sí lo limita.
 > Comandos en [Protege tu equipo: firewall](#protege-tu-equipo-firewall).
 
 ## Descargar y probar
@@ -468,19 +468,31 @@ AP no va cifrado y cualquiera conectado puede intentar hablarle a tu máquina.
 > [!IMPORTANT]
 > En una red abierta, **cualquiera conectado al mismo WiFi puede intentar
 > conectarse a tu computadora**: SSH, servidores de desarrollo, carpetas
-> compartidas, etc. Un firewall que **niegue todo lo entrante** lo bloquea.
+> compartidas, etc. Un firewall con política de **negar lo entrante** bloquea
+> las conexiones que no hayas permitido explícitamente. Lo que queda abierto
+> depende de las **reglas efectivas**: sus excepciones y la interfaz/zona de
+> cada red. Por eso cada sección de abajo termina con una verificación.
 > Club-AutotalPlay sigue funcionando con el firewall activo (solo hace
 > conexiones salientes).
+
+> [!CAUTION]
+> **¿Administras tu equipo a distancia (SSH, escritorio remoto, Tailscale)?**
+> Revisa tus reglas **antes** de activar o endurecer el firewall y deja
+> permitido el acceso que necesitas, o puedes quedarte sin entrada.
 
 **Linux (Ubuntu / Debian / Mint)** — `ufw`:
 
 ```bash
-sudo ufw enable                 # activa el firewall (y al arrancar el sistema)
-sudo ufw status verbose         # debe decir: Estado: activo · deny (entrantes)
+sudo ufw status numbered        # 1. revisa las reglas que ya existen (excepciones)
+sudo ufw default deny incoming  # 2. política explícita: negar lo entrante...
+sudo ufw default allow outgoing #    ...y permitir lo saliente
+sudo ufw enable                 # 3. activa (también al arrancar el sistema)
+sudo ufw status verbose         # 4. verifica: "Estado: activo" y "deny (entrantes)"
 ```
 
-Si usas Tailscale y quieres seguir entrando a tu equipo por ahí:
-`sudo ufw allow in on tailscale0` (antes del `enable`).
+En el paso 4, cada línea `ALLOW IN` de la tabla es una excepción que **sigue
+abierta**: confirma que todas sean intencionales. Si entras por Tailscale,
+`sudo ufw allow in on tailscale0` la limita a esa interfaz.
 
 > [!WARNING]
 > Que `systemctl status ufw` diga *active* **no** significa que el firewall
@@ -489,29 +501,56 @@ Si usas Tailscale y quieres seguir entrando a tu equipo por ahí:
 
 **Linux (Fedora / RHEL)** — `firewalld`:
 
+Que firewalld corra y la zona sea `public` **no** demuestra que todo esté
+bloqueado: `public` trae servicios permitidos de fábrica (en Fedora, `ssh`
+y `dhcpv6-client`), y Fedora Workstation asigna por defecto la zona
+`FedoraWorkstation`, que abre los puertos 1025-65535. Lo que importa es la
+zona **de la interfaz WiFi** y lo que esa zona permite:
+
 ```bash
 sudo systemctl enable --now firewalld
-sudo firewall-cmd --set-default-zone=public
-sudo firewall-cmd --state       # debe decir: running
+sudo firewall-cmd --get-active-zones                 # 1. ¿qué zona tiene tu WiFi?
+nmcli connection show --active                       # 2. nombre de tu conexión WiFi
+#    (el nombre de la conexión puede no ser el SSID; usa el que salga ahí)
+nmcli connection modify "<conexión>" connection.zone public   # 3. asígnale public
+nmcli connection up "<conexión>"
+sudo firewall-cmd --zone=public --list-all           # 4. revisa services: y ports:
+# 5. quita lo que no necesites recibir desde esta red, p.ej.:
+sudo firewall-cmd --zone=public --remove-service=ssh --permanent
+sudo firewall-cmd --reload
+sudo firewall-cmd --get-active-zones                 # 6. verifica: tu WiFi en public
+sudo firewall-cmd --zone=public --list-all           #    y solo lo intencional permitido
 ```
+
+Más estricto: la zona `block` rechaza todo lo entrante salvo respuestas a
+conexiones que tú iniciaste (`connection.zone block`).
 
 **Windows** — PowerShell **como administrador**:
 
 ```powershell
-# 1. Marca esta red como Pública (Windows aplica reglas más estrictas)
-Set-NetConnectionProfile -Name "Club_Totalplay_WiFi" -NetworkCategory Public
+# 1. Encuentra el perfil de TU WiFi. Su Name no siempre es el SSID:
+Get-NetConnectionProfile | Format-Table InterfaceIndex, InterfaceAlias, Name, NetworkCategory
 
-# 2. Firewall encendido en todos los perfiles
+# 2. Márcalo como Público usando el InterfaceIndex que viste arriba (ej. 12)
+Set-NetConnectionProfile -InterfaceIndex 12 -NetworkCategory Public
+
+# 3. Firewall encendido en todos los perfiles
 Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True
 
-# 3. Verifica: Enabled = True y DefaultInboundAction = Block (o NotConfigured)
-Get-NetFirewallProfile | Format-Table Name, Enabled, DefaultInboundAction
-Get-NetConnectionProfile | Format-Table Name, NetworkCategory
+# 4. Verifica: tu WiFi en Public; Enabled = True; DefaultInboundAction = Block
+#    (NotConfigured también equivale a Block por defecto)
+Get-NetConnectionProfile | Format-Table InterfaceAlias, Name, NetworkCategory
+Get-NetFirewallProfile | Format-Table Name, Enabled, DefaultInboundAction, AllowInboundRules
 ```
 
-Sin terminal: *Configuración → Red e Internet → Wi-Fi → Club_Totalplay_WiFi →
-Tipo de perfil de red: **Pública***, y *Seguridad de Windows → Firewall y
-protección de red*: los tres perfiles **activados**.
+`AllowInboundRules = True` significa que las reglas de "apps permitidas"
+siguen aplicando en ese perfil. Para que el perfil Público ignore esas
+excepciones (equivale a *"Bloquear todas las conexiones entrantes"*):
+`Set-NetFirewallProfile -Profile Public -AllowInboundRules False`.
+
+Sin terminal: *Configuración → Red e Internet → Wi-Fi → (tu red) → Tipo de
+perfil de red: **Pública***, y *Seguridad de Windows → Firewall y protección
+de red*: los tres perfiles **activados**.
 
 **Revisa qué está escuchando** (lo que quedaría expuesto sin firewall):
 
