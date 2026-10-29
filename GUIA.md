@@ -5,6 +5,11 @@ App que mantiene viva la sesión de la red pública `Club_Totalplay_WiFi`
 `POST` que hace el navegador al terminar el video), sin browser ni video.
 Corre como daemon en segundo plano con icono en la bandeja.
 
+> [!IMPORTANT]
+> **Activa el firewall de tu equipo antes de usar esta red** (es abierta).
+> Comandos para Linux y Windows en
+> [Protege tu equipo: firewall](#protege-tu-equipo-firewall).
+
 ---
 
 ## Windows
@@ -166,13 +171,66 @@ AP no va cifrado y cualquiera conectado puede intentar hablarle a tu máquina.
 - **Nunca toca otra red.** Si estás en otro WiFi, o no se puede saber en cuál,
   no hace nada.
 
-**Lo que la app NO puede hacer por ti** (recomendado al usar esta red):
+### Protege tu equipo: firewall
 
-- **Firewall activo, entrada denegada.** Ubuntu: `sudo ufw enable` y revisa con
-  `sudo ufw status verbose` que diga `deny (incoming)`. Windows: perfil de red
-  **Pública** (Configuración → Red → Propiedades).
-- **No expongas servicios en `0.0.0.0`** (servidores de desarrollo, SSH con
-  contraseña). Revisa con `ss -tulnp` (Linux) o `netstat -ano` (Windows).
+> [!IMPORTANT]
+> En una red abierta, **cualquiera conectado al mismo WiFi puede intentar
+> conectarse a tu computadora**: SSH, servidores de desarrollo, carpetas
+> compartidas, etc. Un firewall que **niegue todo lo entrante** lo bloquea.
+> Club-AutotalPlay sigue funcionando con el firewall activo (solo hace
+> conexiones salientes).
+
+**Linux (Ubuntu / Debian / Mint)** — `ufw`:
+
+```bash
+sudo ufw enable                 # activa el firewall (y al arrancar el sistema)
+sudo ufw status verbose         # debe decir: Estado: activo · deny (entrantes)
+```
+
+Si usas Tailscale y quieres seguir entrando a tu equipo por ahí:
+`sudo ufw allow in on tailscale0` (antes del `enable`).
+
+> [!WARNING]
+> Que `systemctl status ufw` diga *active* **no** significa que el firewall
+> filtre: puede estar instalado pero deshabilitado. Lo que cuenta es que
+> `sudo ufw status` diga **Estado: activo**.
+
+**Linux (Fedora / RHEL)** — `firewalld`:
+
+```bash
+sudo systemctl enable --now firewalld
+sudo firewall-cmd --set-default-zone=public
+sudo firewall-cmd --state       # debe decir: running
+```
+
+**Windows** — PowerShell **como administrador**:
+
+```powershell
+# 1. Marca esta red como Pública (Windows aplica reglas más estrictas)
+Set-NetConnectionProfile -Name "Club_Totalplay_WiFi" -NetworkCategory Public
+
+# 2. Firewall encendido en todos los perfiles
+Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True
+
+# 3. Verifica: Enabled = True y DefaultInboundAction = Block (o NotConfigured)
+Get-NetFirewallProfile | Format-Table Name, Enabled, DefaultInboundAction
+Get-NetConnectionProfile | Format-Table Name, NetworkCategory
+```
+
+Sin terminal: *Configuración → Red e Internet → Wi-Fi → Club_Totalplay_WiFi →
+Tipo de perfil de red: **Pública***, y *Seguridad de Windows → Firewall y
+protección de red*: los tres perfiles **activados**.
+
+**Revisa qué está escuchando** (lo que quedaría expuesto sin firewall):
+
+- Linux: `ss -tulnp` — todo lo que diga `0.0.0.0`, `*` o `[::]` acepta
+  conexiones de la red.
+- Windows: `netstat -ano | findstr LISTENING`
+
+**Además:**
+
+- **No expongas servicios en `0.0.0.0`** sin necesidad (servidores de
+  desarrollo, SSH con contraseña); usa `127.0.0.1`.
 - **Solo HTTPS**, o una VPN (Tailscale/WireGuard) para lo sensible.
 - Un AP falso con el mismo SSID es indistinguible en una red abierta: la app
   no le entrega nada útil (el `POST` exige el certificado del portal real),
