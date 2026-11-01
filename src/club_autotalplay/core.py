@@ -51,11 +51,11 @@ USER_AGENT = (
 )
 POLL_SECONDS = 20          # cada cuantos segundos se chequea (red sana)
 POLL_DOWN_SECONDS = 5      # sondeo rapido mientras la red NO esta online
-TIMEOUT = 8                # timeout por request
+TIMEOUT = 5                # timeout por request (antes 8s; el portal responde rapido o falla rapido)
 COOLDOWN_SECONDS = 45      # no reintentar el grant mas seguido que esto
 WIFI_RETRY_SECONDS = 30    # no re-botear el WiFi mas seguido que esto
 FAIL_STREAK_ESCALATE = 5   # N ciclos sin online -> reinicio total (ignora cooldowns)
-GRANT_RECHECK_SECONDS = 3  # tras un grant sin respuesta, re-probar esto antes de rendirse
+GRANT_RECHECK_SECONDS = 1  # tras un grant sin respuesta, re-probar esto antes de rendirse (antes 3s)
 SESSION_SECONDS = 900      # el portal corta ~900 s despues del grant (ver next_poll_seconds)
 EXPIRY_LEAD_SECONDS = 20   # abrir la ventana de sondeo rapido este tanto antes
 EXPIRY_TAIL_SECONDS = 60   # ...y mantenerla este tanto despues
@@ -258,12 +258,12 @@ def _redact_location(location):
         return "<location no parseable>"
 
 
-def grant_session(params, retries=1):
+def grant_session(params, retries=3):
     """POST al endpoint que otorga la sesion. Devuelve True si 2xx.
 
     El portal a veces falla intermitentemente (IncompleteRead / Remote end
     closed, visto 2026-10-13 04:02-04:48): se reintenta `retries` veces con
-    1 s de separacion antes de declarar fracaso.
+    0.5 s de separacion antes de declarar fracaso.
 
     Muchas veces ese "fallo" es un exito: el AP abre el trafico al procesar
     el POST y corta la respuesta a medio camino. Evidencia (logs
@@ -271,7 +271,12 @@ def grant_session(params, retries=1):
     IncompleteRead/Remote end closed, se re-boteo el radio y el internet
     volvio SIN ningun 204 despues. Por eso, tras cada intento fallido se
     re-prueba unos segundos antes de reintentar (y antes de que el ciclo
-    caiga al bounce de radio, que cuesta ~20-40 s).
+    caiga al bounce de radio, que cuesta ~20-40 s y apaga el WiFi).
+
+    Se suben los reintentos y se baja el timeout para dar mas oportunidades
+    al portal ANTES de recurrir al bounce del radio (lo que "apaga el wifi"
+    y tarda varios segundos). Cuando el grant falla pero el probe ya da 204,
+    cuenta como exito sin bounce.
     """
     for intento in range(retries + 1):
         if _grant_session_once(params):
@@ -281,7 +286,7 @@ def grant_session(params, retries=1):
             return True
         if intento < retries:
             log.warning("grant fallo (intento %d/%d); reintentando...", intento + 1, retries + 1)
-            time.sleep(1)
+            time.sleep(0.5)
     return False
 
 
