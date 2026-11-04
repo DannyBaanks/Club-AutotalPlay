@@ -1039,3 +1039,12 @@ def test_tray_click_abre_panel_una_vez(monkeypatch):
     app._open_gui(None, None)  # firma de callback de pystray
     app._open_gui(None, None)
     assert len(spawned) == 1 and spawned[0][-1] == "gui"
+
+
+def test_autostart_exec_lleva_subcomando_app(monkeypatch, tmp_path):
+    """El AppImage sin subcomando no abre nada: el autostart debe pasar `app`."""
+    from club_autotalplay import gui
+    fake = tmp_path / "Club-AutotalPlay.AppImage"
+    fake.write_text("")
+    monkeypatch.setattr(gui.os.path, "expanduser", lambda p: str(fake))
+    assert gui._autostart_exec() == f'"{fake}" app'

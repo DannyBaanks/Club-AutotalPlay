@@ -84,15 +84,18 @@ def _autostart_exec():
 
     Prefiere el AppImage si existe (M3); si no, el launcher del venv.
     """
+    # Siempre con el subcomando `app`: el CLI exige uno y el AppImage sin
+    # argumentos sale con error (el autostart no mostraba nada). Rutas entre
+    # comillas: la del repo lleva espacios ("ISyCo Git").
     appimage = os.path.expanduser("~/.local/bin/Club-AutotalPlay.AppImage")
     if os.path.exists(appimage):
-        return appimage
+        return f'"{appimage}" app'
     # venv del repo (desarrollo)
     venv_bin = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "..", ".venv", "bin", "club-autotalplay")
     )
     if os.path.exists(venv_bin):
-        return f"{venv_bin} app"
+        return f'"{venv_bin}" app'
     return "club-autotalplay app"
 
 
