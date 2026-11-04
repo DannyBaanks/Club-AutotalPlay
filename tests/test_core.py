@@ -910,3 +910,100 @@ def test_dir_de_estado_queda_privado(tmp_path, monkeypatch):
     core.save_state({"x": 1})
     assert (d.stat().st_mode & 0o777) == 0o700
     assert ((d / "state.json").stat().st_mode & 0o777) == 0o600
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-04: recuperacion mas rapida (recaida tras grant, DNS, re-probe)
+# ---------------------------------------------------------------------------
+
+def test_recaida_tras_grant_ok_regrantea_sin_bounce(monkeypatch):
+    """Grant OK hace 20 s y la sesion murio: re-grant inmediato, no bounce."""
+    monkeypatch.setattr(core, "probe", lambda: ("down", None))
+    monkeypatch.setattr(core, "current_ssid", lambda: core.SSID)
+    monkeypatch.setattr(core, "wifi_connected", lambda: True)
+    monkeypatch.setattr(core, "grant_session", lambda p: True)
+    monkeypatch.setattr(core, "verify_online", lambda deadline=0: True)
+    monkeypatch.setattr(core, "save_state", lambda s: None)
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+
+    def forbidden():
+        raise AssertionError("no debe re-botear el radio")
+
+    monkeypatch.setattr(core, "bring_up_wifi", forbidden)
+    now = core.now_iso()
+    state = _fresh_state(
+        last_portal_params=dict(PORTAL_PARAMS),
+        last_grant_attempt=now, last_grant_ok=now,
+    )
+    assert core.cycle(state) == "granted-cached"
+    assert state["last_relapse_regrant"]
+
+
+def test_recaida_repetida_vuelve_a_respetar_cooldown(monkeypatch):
+    """Una segunda recaida dentro de la ventana no martilla el portal."""
+    now = core.now_iso()
+    state = _fresh_state(
+        last_grant_attempt=now, last_grant_ok=now, last_relapse_regrant=now,
+    )
+    assert core._grant_in_cooldown(state, escalate=False) is True
+    assert core._grant_in_cooldown(state, escalate=True) is False
+
+
+def test_grant_fallido_sigue_en_cooldown():
+    state = _fresh_state(last_grant_attempt=core.now_iso(), last_grant_ok="")
+    assert core._grant_in_cooldown(state, escalate=False) is True
+
+
+def _dns_conn(calls):
+    class FakeConn:
+        def __init__(self, *a, **k): pass
+        def request(self, *a, **k):
+            calls["post"] += 1
+            raise core.socket.gaierror(-3, "Temporary failure in name resolution")
+        def close(self): pass
+    return FakeConn
+
+
+def test_grant_sin_dns_no_reintenta_a_ciegas(monkeypatch):
+    calls = {"post": 0}
+    monkeypatch.setattr(core.http.client, "HTTPSConnection", _dns_conn(calls))
+    monkeypatch.setattr(core, "_wait_link", lambda d: ("down", None))
+    assert core.grant_session(PORTAL_PARAMS) is False
+    assert calls["post"] == 1
+
+
+def test_grant_sin_dns_link_vuelve_online(monkeypatch):
+    calls = {"post": 0}
+    monkeypatch.setattr(core.http.client, "HTTPSConnection", _dns_conn(calls))
+    monkeypatch.setattr(core, "_wait_link", lambda d: ("online", None))
+    assert core.grant_session(PORTAL_PARAMS) is True
+
+
+def test_grant_sin_dns_reintenta_con_params_frescos(monkeypatch):
+    seen = []
+
+    def once(p):
+        seen.append(p)
+        return "dns" if len(seen) == 1 else True
+
+    monkeypatch.setattr(core, "_grant_session_once", once)
+    monkeypatch.setattr(core, "_wait_link", lambda d: ("captive", CAPTIVE_LOC))
+    assert core.grant_session({"ip": "viejo"}) is True
+    assert seen[1] == core.parse_portal_params(CAPTIVE_LOC)
+
+
+def test_reprobe_online_evita_bounce(monkeypatch):
+    """Grant fallo pero al re-probar ya hay 204: no se apaga el radio."""
+    seq = iter([("down", None), ("online", None)])
+    monkeypatch.setattr(core, "probe", lambda: next(seq))
+    monkeypatch.setattr(core, "current_ssid", lambda: core.SSID)
+    monkeypatch.setattr(core, "wifi_connected", lambda: True)
+    monkeypatch.setattr(core, "grant_session", lambda p: False)
+    monkeypatch.setattr(core, "save_state", lambda s: None)
+
+    def forbidden():
+        raise AssertionError("no debe re-botear el radio")
+
+    monkeypatch.setattr(core, "bring_up_wifi", forbidden)
+    state = _fresh_state(last_portal_params=dict(PORTAL_PARAMS))
+    assert core.cycle(state) == "granted"

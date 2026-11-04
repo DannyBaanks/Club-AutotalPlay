@@ -52,6 +52,10 @@ USER_AGENT = (
 POLL_SECONDS = 20          # cada cuantos segundos se chequea (red sana)
 POLL_DOWN_SECONDS = 5      # sondeo rapido mientras la red NO esta online
 TIMEOUT = 5                # timeout por request (antes 8s; el portal responde rapido o falla rapido)
+GRANT_TIMEOUT = 3          # timeout del POST de grant: los 204 llegan en 0.5-1.7 s; un read
+                           # timeout de 5 s x4 intentos retrasaba el bounce ~22 s (log 2026-11-04 00:16)
+DNS_WAIT_SECONDS = 4       # sin DNS el link se cayo (roaming entre APs, ~3 s): esperar al probe
+                           # en vez de quemar reintentos del POST (log 2026-11-03 21:50)
 COOLDOWN_SECONDS = 45      # no reintentar el grant mas seguido que esto
 WIFI_RETRY_SECONDS = 30    # no re-botear el WiFi mas seguido que esto
 FAIL_STREAK_ESCALATE = 5   # N ciclos sin online -> reinicio total (ignora cooldowns)
@@ -279,8 +283,24 @@ def grant_session(params, retries=3):
     cuenta como exito sin bounce.
     """
     for intento in range(retries + 1):
-        if _grant_session_once(params):
+        res = _grant_session_once(params)
+        if res is True:
             return True
+        if res == "dns":
+            # Sin resolucion DNS no hay link: el portal es inalcanzable y los
+            # reintentos a ciegas solo retrasan la recuperacion. Esperar a que
+            # NM re-asocie (roaming, ~3 s): si vuelve online, listo; si vuelve
+            # con captive del portal, reintentar con los params FRESCOS.
+            st, loc = _wait_link(DNS_WAIT_SECONDS)
+            if st == "online":
+                log.info("link volvio tras fallo de DNS: sesion sigue viva")
+                return True
+            fresh = parse_portal_params(loc) if st == "captive" and is_trusted_portal(loc) else None
+            if not fresh or intento >= retries:
+                log.warning("grant sin DNS (link caido); no reintento el POST")
+                return False
+            params = fresh
+            continue
         if verify_online(deadline=GRANT_RECHECK_SECONDS, interval=0.5):
             log.info("grant sin respuesta pero el probe ya da 204: sesion otorgada")
             return True
@@ -290,11 +310,24 @@ def grant_session(params, retries=3):
     return False
 
 
+def _wait_link(deadline, interval=0.5):
+    """Sondea hasta `deadline` s; devuelve (estado, location) al ver online/captive."""
+    t0 = time.time()
+    st, loc = "down", None
+    while time.time() - t0 < deadline:
+        st, loc = probe()
+        if st in ("online", "captive"):
+            return st, loc
+        time.sleep(interval)
+    return st, loc
+
+
 def _grant_session_once(params):
+    """True si 2xx; "dns" si no se pudo resolver el host; False en otro fallo."""
     body = json.dumps(params).encode("utf-8")
     ctx = ssl.create_default_context()
     try:
-        conn = http.client.HTTPSConnection(GRANT_HOST, 443, timeout=TIMEOUT, context=ctx)
+        conn = http.client.HTTPSConnection(GRANT_HOST, 443, timeout=GRANT_TIMEOUT, context=ctx)
         conn.request(
             "POST",
             GRANT_PATH,
@@ -315,6 +348,9 @@ def _grant_session_once(params):
             resp.status, resp.reason, data[:120], _redact_params(params),
         )
         return ok
+    except socket.gaierror as e:
+        log.error("grant POST fallo: %s", e)
+        return "dns"
     except Exception as e:
         log.error("grant POST fallo: %s", e)
         return False
@@ -617,6 +653,34 @@ def _iso_to_epoch(s):
         return 0.0
 
 
+def _grant_in_cooldown(state, escalate):
+    """True si NO se debe intentar el grant todavia.
+
+    El cooldown existe para no martillar el portal tras un grant FALLIDO. Si
+    el ultimo intento salio bien (last_grant_ok >= last_grant_attempt) y la
+    sesion se cayo enseguida (portal que corta la respuesta y "otorga" a
+    medias: logs 2026-11-03 16:53, 22:43, 22:59), re-grantear de inmediato
+    es lo correcto; antes el cooldown mandaba directo al bounce del radio
+    (~15 s con el WiFi apagado).
+    """
+    if escalate:
+        return False
+    last = state.get("last_grant_attempt", "")
+    if not last or (time.time() - _iso_to_epoch(last)) >= COOLDOWN_SECONDS:
+        return False
+    ok = state.get("last_grant_ok", "")
+    if not (ok and _iso_to_epoch(ok) >= _iso_to_epoch(last)):
+        return True
+    # Una sola vez por ventana: si la sesion recae una y otra vez, el
+    # siguiente intento vuelve a respetar el cooldown y cae al bounce.
+    prev = state.get("last_relapse_regrant", "")
+    if prev and (time.time() - _iso_to_epoch(prev)) < COOLDOWN_SECONDS * 2:
+        return True
+    state["last_relapse_regrant"] = now_iso()
+    log.info("sesion recayo tras un grant OK; re-grant inmediato (sin esperar cooldown)")
+    return False
+
+
 def _try_grant_from_probe(state):
     """Si el probe dice captive, intenta grant. Devuelve True si restauro online."""
     st, loc = probe()
@@ -686,7 +750,7 @@ def cycle(state):
         if parsed:
             state["last_portal_params"] = parsed
         last = state.get("last_grant_attempt", "")
-        can_grant = escalate or not (last and (time.time() - _iso_to_epoch(last)) < COOLDOWN_SECONDS)
+        can_grant = not _grant_in_cooldown(state, escalate)
         if can_grant:
             state["last_grant_attempt"] = now_iso()
             save_state(state)
@@ -707,7 +771,7 @@ def cycle(state):
         # grant no basto (cae al bounce de abajo).
         cached = state.get("last_portal_params")
         last = state.get("last_grant_attempt", "")
-        can_grant = escalate or not (last and (time.time() - _iso_to_epoch(last)) < COOLDOWN_SECONDS)
+        can_grant = not _grant_in_cooldown(state, escalate)
         if cached and can_grant:
             state["last_grant_attempt"] = now_iso()
             save_state(state)
@@ -724,6 +788,13 @@ def cycle(state):
     # "down" o grant fallido: quizas el WiFi se cayo. Re-botear con cooldown.
     if not wifi_connected():
         log.warning("WiFi no conectado (ssid=%r)", current_ssid())
+    elif probe()[0] == "online":
+        # Ultima oportunidad barata ANTES de apagar el radio: si mientras
+        # tanto NM re-asocio (roaming) o el grant tardo en surtir efecto,
+        # el probe ya da 204 y el bounce solo cortaria la conexion.
+        state["fail_streak"] = 0
+        log.info("restaurado sin bounce (re-probe previo al radio)")
+        return "granted"
     last_bounce = state.get("last_bounce", "")
     can_bounce = escalate or not (last_bounce and (time.time() - _iso_to_epoch(last_bounce)) < WIFI_RETRY_SECONDS)
     if not can_bounce:
