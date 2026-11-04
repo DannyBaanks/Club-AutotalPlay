@@ -25,8 +25,10 @@ que cambia de color:
 | 🟠 Ámbar | reconectando |
 | 🔴 Rojo | sin conexión |
 
-Click izquierdo al icono abre el menú: **Reconectar ahora** / **Ver estado** /
-**Salir**.
+**Click al icono → abre el panel**: estado, **Reconectar ahora** (te dice qué
+pasó), **Diagnóstico** (= `debug --dry`, redactado, con *Copiar*), **Abrir log
+completo**, **Iniciar con el sistema** y los últimos eventos. Click derecho:
+menú con las mismas acciones + **Salir**.
 
 ### Que arranque sola al iniciar sesión
 
@@ -97,6 +99,14 @@ chmod +x Club-AutotalPlay-x86_64.AppImage
 ./Club-AutotalPlay-x86_64.AppImage install   # servicio systemd user (autoarranque)
 ```
 
+**Click al icono → panel** (Reconectar / Diagnóstico / Abrir log / Iniciar con
+el sistema). En GNOME el icono del AppImage no tiene menú, así que el click es
+la única acción: abre el panel. Sin icono: `./Club-AutotalPlay-x86_64.AppImage gui`.
+
+El **servicio** mantiene la reconexión; para que además salga el **icono** al
+iniciar sesión, marca *Iniciar con el sistema* en el panel (escribe
+`~/.config/autostart/club-autotalplay.desktop` con `Exec="…AppImage" app`).
+
 ### Servicio
 
 ```bash
@@ -111,6 +121,7 @@ journalctl --user -u club-autotalplay -f     # logs en vivo
 ./Club-AutotalPlay-x86_64.AppImage status --live # fuerza sondeo real
 ./Club-AutotalPlay-x86_64.AppImage once          # un ciclo
 ./Club-AutotalPlay-x86_64.AppImage debug         # diagnostico crudo
+./Club-AutotalPlay-x86_64.AppImage gui --diag    # panel + diagnostico
 ```
 
 ### Archivos (Linux)
@@ -121,6 +132,7 @@ journalctl --user -u club-autotalplay -f     # logs en vivo
 | Servicio | `~/.config/systemd/user/club-autotalplay.service` |
 | Estado | `~/.local/state/club-autotalplay/state.json` |
 | Log | `~/.local/state/club-autotalplay/watchdog.log` |
+| Autostart del icono | `~/.config/autostart/club-autotalplay.desktop` |
 
 ---
 
@@ -305,3 +317,15 @@ de red*: los tres perfiles **activados**.
   operativo, no el portal. Mientras el daemon corra, la sesión se renueva sola
   aunque esa etiqueta aparezca un momento.
 - **La sesión dura ~15 min** y se renueva sola cada vez que expira.
+- **El AppImage necesita un subcomando.** Sin argumentos el CLI sale con
+  error; el icono es `… app`. Hasta v0.1.6 la casilla *Iniciar con el
+  sistema* escribía el `Exec` sin `app` y al iniciar sesión no salía nada.
+  Desde v0.2.0 la app repara ese `.desktop` sola al abrirse.
+- **Ahorro de energía del WiFi (Ubuntu).** `default-wifi-powersave-on.conf`
+  se ordena después de `99-…-off.conf` y gana: el WiFi queda en power save
+  (más latencia, timeouts del portal). Revisa `iw dev wlo1 get power_save`; el
+  arreglo es un `zz-wifi-powersave-off.conf` con `wifi.powersave = 2` y
+  `sudo systemctl reload NetworkManager`.
+- **"Reconectar ahora" desde el panel queda en el log** igual que los ciclos
+  del daemon. Cerrar el panel a media reconexión no deja el WiFi apagado: la
+  app termina el ciclo antes de salir.

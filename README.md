@@ -4,7 +4,7 @@
 
 **Auto-reconnect para la red pública `Club_Totalplay_WiFi` (Totalplay).**
 
-Icono en la bandeja · reconexión sola · sin browser ni video.
+Icono en la bandeja · panel con diagnóstico · reconexión sola · sin browser ni video.
 
 [![Linux](https://img.shields.io/badge/platform-Linux-blue?logo=linux&logoColor=white)](#)
 [![Windows](https://img.shields.io/badge/platform-Windows-blue?logo=windows&logoColor=white)](#)
@@ -33,7 +33,13 @@ sesión nueva — y vuelves a tener internet.
    `204`, cuenta como otorgada — sin re-botear el radio.
 4. Si el sondeo se cae del todo pero el WiFi sigue asociado, reintenta ese
    `POST` con los últimos parámetros conocidos — **sin tocar el radio**.
-5. Si ni eso basta, re-botea el WiFi por `nmcli` como último recurso.
+   Si la sesión recae a los pocos segundos de un grant, lo repite de
+   inmediato en vez de esperar el cooldown.
+5. Si se pierde el DNS (la laptop brincando entre antenas del mismo SSID),
+   espera ~4 s a que NetworkManager re-asocie y, si aparece el portal,
+   grantea con la IP nueva.
+6. Antes de re-botear el WiFi por `nmcli` (último recurso) vuelve a sondear:
+   si el internet ya regresó, no apaga el radio.
 
 Todo en segundo plano, con un **icono en la bandeja** que cambia de color:
 
@@ -72,6 +78,10 @@ guarda sus datos con permisos privados. Ver
    ```bash
    ./Club-AutotalPlay-x86_64.AppImage install   # servicio systemd user
    ```
+
+4. Para que el **icono** salga solo al iniciar sesión: click al icono → panel
+   → marca **Iniciar con el sistema**. (El servicio de `install` mantiene la
+   reconexión; el autostart es para ver el icono.)
 
 > **Nota AppImage:** si tu distro no monta AppImages, instala FUSE:
 > `sudo apt install libfuse2t64` (Debian/Ubuntu) o `sudo dnf install fuse-libs` (Fedora).
@@ -144,7 +154,22 @@ systemctl --user status club-autotalplay
 journalctl --user -u club-autotalplay -f     # logs en vivo
 ```
 
-El icono de la bandeja tiene menú: **Reconectar ahora**, **Ver estado**, **Salir**.
+### El panel
+
+**Click al icono** → abre el panel (una sola ventana):
+
+| Botón | Qué hace | Equivale a |
+|---|---|---|
+| **Reconectar ahora** | corre un ciclo y te dice qué pasó (`sesión otorgada`, `ya estabas en línea`, `estás en otra red`…) | `once` |
+| **Diagnóstico** | estado crudo de probe / portal / WiFi, redactado, con botón **Copiar** | `debug --dry` |
+| **Abrir log completo** | abre `watchdog.log` con tu editor | — |
+| **Iniciar con el sistema** | autostart del icono al iniciar sesión | — |
+
+Abajo muestra los últimos eventos del log. En escritorios donde el icono sí
+tiene menú (AppIndicator) también trae *Abrir panel*, *Reconectar ahora*,
+*Diagnóstico*, *Abrir log completo* y *Salir*. En GNOME con el AppImage el
+icono no tiene menú (el empaquetado no trae PyGObject), por eso el click abre
+el panel directamente. También: `club-autotalplay gui` / `gui --diag`.
 
 `status` y `status --live` enmascaran IP, MAC y el identificador de zona del
 portal. El estado local conserva los últimos parámetros necesarios para
@@ -228,6 +253,32 @@ POST https://clubwifi.totalplay.com.mx/ClubMovil/video-completado
 Todo lo de esta sección se capturó en Ubuntu 24.04 (GNOME, X11) contra la red
 `Club_Totalplay_WiFi`, con el servicio systemd user corriendo el código del
 repo. Los valores de red (IP / MAC / `accname`) van enmascarados.
+
+### v0.2.0: menos bounces de radio (2026-11-04)
+
+Análisis de `watchdog.log` del 2026-10-27 al 11-04. Los grants directos
+seguían en ~1 s de mediana; lo que creció fueron los **bounces de radio**
+(~15-20 s con el WiFi apagado): ~25/día el 11-04 contra ~18-19/día los días
+anteriores. Disparadores encontrados en el log:
+
+| Disparador del bounce | Qué pasaba | Arreglo en v0.2.0 |
+|---|---|---|
+| Sesión que recae 20-40 s después de un grant "sin respuesta" | el cooldown de 45 s bloqueaba el re-grant y caía directo al bounce | re-grant inmediato si el último grant salió bien (una vez por ventana) |
+| DNS caído (roaming entre dos BSSID del mismo SSID) | 4 `POST`s a ciegas antes del bounce, aunque NM re-asociaba solo en ~3 s | espera al link 4 s; si vuelve el portal, grant con la IP nueva |
+| `read timeout` del portal | 5 s × 4 intentos ≈ 22 s antes del bounce | timeout del grant de 3 s (los `204` llegan en 0.5-1.7 s) |
+
+Además: re-sondeo antes de apagar el radio, y el resultado `recovered` cuando
+el link vuelve sin grant (no re-ancla la ventana de expiración de 15 min).
+
+**NOT_DEMONSTRATED todavía:** cuánto bajan los bounces por día con v0.2.0 —
+se mide comparando el log de los próximos días con las cifras de arriba.
+
+> **Trampa del sistema encontrada en el camino:** en Ubuntu,
+> `/etc/NetworkManager/conf.d/default-wifi-powersave-on.conf` se lee
+> **después** de un `99-wifi-powersave-off.conf` (orden alfabético: `d` > `9`)
+> y deja el ahorro de energía del WiFi encendido. Verifica con
+> `iw dev wlo1 get power_save`. Arreglo: un archivo que ordene al final, p.ej.
+> `zz-wifi-powersave-off.conf` con `[connection]` / `wifi.powersave = 2`.
 
 ### 0. Lo más reciente: de ~21 s a ~3 s por corte (2026-10-28)
 
