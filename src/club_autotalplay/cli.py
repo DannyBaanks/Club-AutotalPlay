@@ -104,7 +104,7 @@ def _cmd_tray(args):
 def _cmd_gui(args):
     """Solo la GUI (lector de estado); el daemon debe correr aparte o via tray."""
     from . import gui
-    gui.run_app()
+    gui.run_app(diag=getattr(args, "diag", False))
     return 0
 
 
@@ -161,6 +161,8 @@ def main(argv=None):
     p_app.set_defaults(func=_cmd_tray)
 
     p_gui = sub.add_parser("gui", help="solo la GUI (lector de estado/logs)")
+    p_gui.add_argument("--diag", action="store_true",
+                       help="abre el panel y corre el diagnostico")
     p_gui.set_defaults(func=_cmd_gui)
 
     args = ap.parse_args(argv)

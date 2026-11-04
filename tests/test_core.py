@@ -1007,3 +1007,35 @@ def test_reprobe_online_evita_bounce(monkeypatch):
     monkeypatch.setattr(core, "bring_up_wifi", forbidden)
     state = _fresh_state(last_portal_params=dict(PORTAL_PARAMS))
     assert core.cycle(state) == "granted"
+
+
+# ---------------------------------------------------------------------------
+# tray: el clic abre el panel en un proceso aparte (una sola instancia)
+# ---------------------------------------------------------------------------
+
+def test_tray_self_command(monkeypatch):
+    from club_autotalplay import tray
+    monkeypatch.delenv("APPIMAGE", raising=False)
+    cmd = tray.self_command("gui")
+    assert cmd[-3:] == ["-m", "club_autotalplay.cli", "gui"]
+    monkeypatch.setenv("APPIMAGE", "/x/App.AppImage")
+    assert tray.self_command("gui", "--diag") == ["/x/App.AppImage", "gui", "--diag"]
+
+
+def test_tray_click_abre_panel_una_vez(monkeypatch):
+    from club_autotalplay import tray
+    spawned = []
+
+    class FakeProc:
+        def poll(self):
+            return None  # sigue abierto
+
+    def fake_popen(cmd):
+        spawned.append(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(tray.subprocess, "Popen", fake_popen)
+    app = tray.TrayApp()
+    app._open_gui(None, None)  # firma de callback de pystray
+    app._open_gui(None, None)
+    assert len(spawned) == 1 and spawned[0][-1] == "gui"

@@ -6,7 +6,11 @@ Al lanzar la app se:
        verde  = online
        ambar  = reconectando / captive
        rojo   = sin conexion
-  3. el menu contextual da: Reconectar ahora, Ver estado, Salir.
+  3. CLIC en el icono = abre el panel (GUI). En escritorios donde pystray
+     no tiene menu (backend xorg: sin PyGObject, el caso del AppImage en
+     GNOME) el clic es lo UNICO que llega, por eso la accion por defecto
+     debe abrir algo visible. El panel trae todas las opciones del CLI.
+     Con menu (AppIndicator): Abrir panel, Reconectar, Diagnostico, Log, Salir.
 
 Requiere pystray + Pillow (extra 'gui') y un backend de tray (en X11,
 pystray usa AppIndicator/ayatana si esta disponible).
@@ -14,6 +18,9 @@ pystray usa AppIndicator/ayatana si esta disponible).
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
+import sys
 import threading
 import time
 
@@ -94,9 +101,24 @@ class TrayApp:
         # idempotente y hay cooldown en state.json)
         threading.Thread(target=daemon.run_once, daemon=True).start()
 
-    def _open_gui(self):
-        from . import gui
-        gui.open_window()
+    def _open_gui(self, *args, panel_args=()):
+        """Abre el panel en un PROCESO aparte (una sola instancia).
+
+        Antes se creaba tk.Tk() dentro del thread de pystray: Tkinter no es
+        seguro fuera del thread principal y un segundo clic abria otra raiz.
+        """
+        if self._gui_proc is not None and self._gui_proc.poll() is None:
+            return  # ya abierto
+        try:
+            self._gui_proc = subprocess.Popen(self_command("gui", *panel_args))
+        except Exception as e:
+            log.error("no pude abrir el panel: %s", e)
+
+    def _open_diag(self, *args):
+        self._open_gui(panel_args=("--diag",))
+
+    def _open_log(self, *args):
+        open_path(core.LOG_PATH)
 
     def _quit(self, icon, item):
         self._stop.set()
@@ -119,8 +141,10 @@ class TrayApp:
             threading.Thread(target=self._daemon_thread, daemon=True, name="daemon").start()
 
         menu = Menu(
-            MenuItem("Reconectar ahora", self._reconnect_now, default=True),
-            MenuItem("Ver estado / logs", self._open_gui),
+            MenuItem("Abrir panel", self._open_gui, default=True),
+            MenuItem("Reconectar ahora", self._reconnect_now),
+            MenuItem("Diagnóstico", self._open_diag),
+            MenuItem("Abrir log completo", self._open_log),
             Menu.SEPARATOR,
             MenuItem("Salir", self._quit),
         )
@@ -133,6 +157,29 @@ class TrayApp:
         threading.Thread(target=self._watcher_thread, daemon=True, name="watcher").start()
 
         self._icon.run()  # bloqueante; corre el loop del tray
+
+
+def self_command(*args):
+    """Comando para relanzar ESTA app con un subcomando del CLI."""
+    appimage = os.environ.get("APPIMAGE")
+    if appimage:
+        return [appimage, *args]
+    if getattr(sys, "frozen", False):  # .exe de PyInstaller
+        return [sys.executable, *args]
+    return [sys.executable, "-m", "club_autotalplay.cli", *args]
+
+
+def open_path(path):
+    """Abre un archivo con la app por defecto del sistema."""
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(path)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except Exception as e:
+        log.error("no pude abrir %s: %s", path, e)
 
 
 def run():

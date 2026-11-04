@@ -3,7 +3,9 @@
 Muestra:
   - indicador de estado (verde/ambar/rojo) + ssid + online
   - timestamp del ultimo grant
-  - boton "Reconectar ahora"
+  - boton "Reconectar ahora" (con el resultado del ciclo visible)
+  - boton "Diagnóstico" (= `debug --dry`: probe/portal sin POST, redactado)
+  - boton "Abrir log completo"
   - tail de los ultimos eventos (lee el log del core)
   - toggle "Iniciar con el sistema" (autostart via ~/.config/autostart)
 
@@ -100,6 +102,8 @@ class GuiWindow:
         self.root.title("Club-AutotalPlay")
         self.root.resizable(False, False)
         self._stop = threading.Event()
+        # resultados de threads de trabajo: Tk solo se toca desde _refresh
+        self._pending = {}
         self._build()
         self._refresh()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -123,9 +127,19 @@ class GuiWindow:
         self.grant_lbl = ttk.Label(frm, text="")
         self.grant_lbl.grid(row=2, column=0, columnspan=2, sticky="w", **pad)
 
-        # boton reconectar
-        btn = ttk.Button(frm, text="Reconectar ahora", command=self._reconnect)
-        btn.grid(row=3, column=0, columnspan=2, sticky="ew", **pad)
+        # acciones (las del CLI: once / debug --dry / log)
+        bar = ttk.Frame(frm)
+        bar.grid(row=3, column=0, columnspan=2, sticky="ew", **pad)
+        for i in range(3):
+            bar.columnconfigure(i, weight=1)
+        self.reconnect_btn = ttk.Button(bar, text="Reconectar ahora", command=self._reconnect)
+        self.reconnect_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.diag_btn = ttk.Button(bar, text="Diagnóstico", command=self._diagnose)
+        self.diag_btn.grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(bar, text="Abrir log completo", command=self._open_log).grid(
+            row=0, column=2, sticky="ew", padx=(4, 0))
+        self.action_lbl = ttk.Label(frm, text="")
+        self.action_lbl.grid(row=7, column=0, columnspan=2, sticky="w", **pad)
 
         # autostart toggle
         self.autostart = tk.BooleanVar(value=_autostart_enabled())
@@ -158,10 +172,61 @@ class GuiWindow:
         grant = (state or {}).get("last_grant_ok")
         self.grant_lbl.configure(text=f"Última sesión otorgada: {grant or '—'}")
         self._set_log(_read_log_tail(12))
+        self._drain_pending()
         self.root.after(2000, self._refresh)
 
+    def _drain_pending(self):
+        if "reconnect" in self._pending:
+            action = self._pending.pop("reconnect")
+            self.action_lbl.configure(text=f"Reconectar: {_ACTION_TEXT.get(action, action)}")
+            self.reconnect_btn.state(["!disabled"])
+        if "diag" in self._pending:
+            self._show_text("Diagnóstico", self._pending.pop("diag"))
+            self.diag_btn.state(["!disabled"])
+            self.action_lbl.configure(text="")
+
+    def _run_bg(self, key, fn):
+        def work():
+            try:
+                self._pending[key] = fn()
+            except Exception as e:
+                self._pending[key] = f"error: {e}"
+        threading.Thread(target=work, daemon=True).start()
+        self.root.after(300, self._poll_pending)
+
+    def _poll_pending(self):
+        if self._pending:
+            self._drain_pending()
+        elif not self._stop.is_set():
+            self.root.after(300, self._poll_pending)
+
     def _reconnect(self):
-        threading.Thread(target=daemon.run_once, daemon=True).start()
+        self.reconnect_btn.state(["disabled"])
+        self.action_lbl.configure(text="Reconectando…")
+        self._run_bg("reconnect", daemon.run_once)
+
+    def diagnose(self):
+        self._diagnose()
+
+    def _diagnose(self):
+        self.diag_btn.state(["disabled"])
+        self.action_lbl.configure(text="Diagnosticando… (unos segundos)")
+        self._run_bg("diag", lambda: core.debug_dump(perform_grant=False, redact=True))
+
+    def _open_log(self):
+        from .tray import open_path
+        open_path(core.LOG_PATH)
+
+    def _show_text(self, title, text):
+        win = tk.Toplevel(self.root)
+        win.title(f"Club-AutotalPlay — {title}")
+        txt = tk.Text(win, width=100, height=30, font=("Monospace", 9),
+                      background="#111", foreground="#ddd")
+        txt.pack(fill="both", expand=True)
+        txt.insert("1.0", text)
+        txt.configure(state="disabled")
+        ttk.Button(win, text="Copiar", command=lambda: (
+            self.root.clipboard_clear(), self.root.clipboard_append(text))).pack(pady=6)
 
     def _toggle_autostart(self):
         try:
@@ -177,12 +242,26 @@ class GuiWindow:
         self.root.mainloop()
 
 
-def open_window():
-    """Abre la GUI. Si ya hay una ventana, la trae al frente."""
-    # corre en el thread principal de tkinter
-    GuiWindow().run()
+_ACTION_TEXT = {
+    "online": "ya estabas en línea",
+    "granted": "sesión otorgada",
+    "granted-cached": "sesión otorgada (sin tocar el radio)",
+    "bounced": "WiFi re-boteado, en línea",
+    "busy": "el daemon ya está en un ciclo; espera unos segundos",
+    "ssid-unknown": "no pude verificar la red WiFi",
+    "other-network": "estás en otra red; no toco nada",
+    "failed": "no se pudo reconectar (revisa Diagnóstico)",
+}
 
 
-def run_app():
-    """Punto de entrada 'app': GUI (y opcionalmente el daemon si no corre)."""
-    open_window()
+def open_window(diag=False):
+    """Abre la GUI (thread principal de tkinter)."""
+    win = GuiWindow()
+    if diag:
+        win.root.after(100, win.diagnose)
+    win.run()
+
+
+def run_app(diag=False):
+    """Punto de entrada 'gui': el panel (el daemon corre aparte)."""
+    open_window(diag=diag)
