@@ -262,8 +262,14 @@ def _redact_location(location):
         return "<location no parseable>"
 
 
+RECOVERED = "recovered"  # el link volvio solo, sin grant (truthy a proposito)
+
+
 def grant_session(params, retries=3):
     """POST al endpoint que otorga la sesion. Devuelve True si 2xx.
+
+    Devuelve RECOVERED (truthy) si el link volvio online sin grant (roaming).
+    Si el portal reaparece con params nuevos, `params` se actualiza IN PLACE.
 
     El portal a veces falla intermitentemente (IncompleteRead / Remote end
     closed, visto 2026-10-13 04:02-04:48): se reintenta `retries` veces con
@@ -293,13 +299,18 @@ def grant_session(params, retries=3):
             # con captive del portal, reintentar con los params FRESCOS.
             st, loc = _wait_link(DNS_WAIT_SECONDS)
             if st == "online":
+                # No hubo grant: la sesion vieja sigue viva tras el roaming.
+                # El llamador NO debe re-anclar la ventana de expiracion.
                 log.info("link volvio tras fallo de DNS: sesion sigue viva")
-                return True
+                return RECOVERED
             fresh = parse_portal_params(loc) if st == "captive" and is_trusted_portal(loc) else None
             if not fresh or intento >= retries:
                 log.warning("grant sin DNS (link caido); no reintento el POST")
                 return False
-            params = fresh
+            # Actualiza el dict del LLAMADOR: tras el roaming la IP cambia y
+            # el llamador cachea estos params para el proximo grant sin bounce.
+            params.clear()
+            params.update(fresh)
             continue
         if verify_online(deadline=GRANT_RECHECK_SECONDS, interval=0.5):
             log.info("grant sin respuesta pero el probe ya da 204: sesion otorgada")
@@ -635,8 +646,11 @@ def handle_captive(location, state):
         log.error("no pude parsear params del portal; location=%s", _redact_location(location))
         return False
     log.info("captive portal detectado -> otorgando sesion: %s", _redact_params(params))
-    if not grant_session(params):
+    res = grant_session(params)
+    if not res:
         return False
+    if res == RECOVERED:
+        return RECOVERED
     if verify_online(deadline=40):
         log.info("SESION OTORGADA - internet restaurado")
         state["last_grant_ok"] = now_iso()
@@ -698,6 +712,7 @@ def _try_grant_from_probe(state):
 
 def cycle(state):
     """Un ciclo completo del watchdog. Devuelve accion tomada."""
+    cycle_started_attempt = state.get("last_grant_attempt", "")
     st, location = probe()
     if st == "online":
         state["fail_streak"] = 0
@@ -754,9 +769,10 @@ def cycle(state):
         if can_grant:
             state["last_grant_attempt"] = now_iso()
             save_state(state)
-            if handle_captive(location, state):
+            res = handle_captive(location, state)
+            if res:
                 state["fail_streak"] = 0
-                return "granted"
+                return "recovered" if res == RECOVERED else "granted"
             # grant fallo -> cae al re-botear abajo (no nos quedamos esperando)
         else:
             log.info("cooldown de grant activo (%s); sin grant, pruebo bounce", last)
@@ -775,7 +791,11 @@ def cycle(state):
         if cached and can_grant:
             state["last_grant_attempt"] = now_iso()
             save_state(state)
-            if grant_session(cached) and verify_online(deadline=15):
+            res = grant_session(cached)
+            if res == RECOVERED:
+                state["fail_streak"] = 0
+                return "recovered"
+            if res and verify_online(deadline=15):
                 state["last_grant_ok"] = now_iso()
                 state["last_portal_params"] = cached
                 state["fail_streak"] = 0
@@ -793,8 +813,11 @@ def cycle(state):
         # tanto NM re-asocio (roaming) o el grant tardo en surtir efecto,
         # el probe ya da 204 y el bounce solo cortaria la conexion.
         state["fail_streak"] = 0
+        # Solo es "granted" si este ciclo SI mando un grant (que surtio
+        # efecto tarde); si no, el link volvio solo y no hay sesion nueva.
+        attempted = state.get("last_grant_attempt", "") != cycle_started_attempt
         log.info("restaurado sin bounce (re-probe previo al radio)")
-        return "granted"
+        return "granted" if attempted else "recovered"
     last_bounce = state.get("last_bounce", "")
     can_bounce = escalate or not (last_bounce and (time.time() - _iso_to_epoch(last_bounce)) < WIFI_RETRY_SECONDS)
     if not can_bounce:

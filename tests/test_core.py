@@ -976,7 +976,7 @@ def test_grant_sin_dns_link_vuelve_online(monkeypatch):
     calls = {"post": 0}
     monkeypatch.setattr(core.http.client, "HTTPSConnection", _dns_conn(calls))
     monkeypatch.setattr(core, "_wait_link", lambda d: ("online", None))
-    assert core.grant_session(PORTAL_PARAMS) is True
+    assert core.grant_session(dict(PORTAL_PARAMS)) == core.RECOVERED
 
 
 def test_grant_sin_dns_reintenta_con_params_frescos(monkeypatch):
@@ -1013,13 +1013,19 @@ def test_reprobe_online_evita_bounce(monkeypatch):
 # tray: el clic abre el panel en un proceso aparte (una sola instancia)
 # ---------------------------------------------------------------------------
 
-def test_tray_self_command(monkeypatch):
-    from club_autotalplay import tray
+def test_self_command(monkeypatch, tmp_path):
+    from club_autotalplay import launch
     monkeypatch.delenv("APPIMAGE", raising=False)
-    cmd = tray.self_command("gui")
+    cmd = launch.self_command("gui")
     assert cmd[-3:] == ["-m", "club_autotalplay.cli", "gui"]
-    monkeypatch.setenv("APPIMAGE", "/x/App.AppImage")
-    assert tray.self_command("gui", "--diag") == ["/x/App.AppImage", "gui", "--diag"]
+    app = tmp_path / "App.AppImage"
+    app.write_text("")
+    monkeypatch.setenv("APPIMAGE", str(app))
+    assert launch.self_command("gui", "--diag") == [str(app), "gui", "--diag"]
+    # APPIMAGE que ya no existe (montaje viejo) no se usa
+    monkeypatch.setenv("APPIMAGE", str(tmp_path / "no-existe"))
+    assert launch.self_command("gui")[-1] == "gui"
+    assert launch.self_command("gui")[0] != str(tmp_path / "no-existe")
 
 
 def test_tray_click_abre_panel_una_vez(monkeypatch):
@@ -1039,12 +1045,85 @@ def test_tray_click_abre_panel_una_vez(monkeypatch):
     app._open_gui(None, None)  # firma de callback de pystray
     app._open_gui(None, None)
     assert len(spawned) == 1 and spawned[0][-1] == "gui"
+    # con el panel abierto, Diagnostico abre su propio proceso (no se pierde)
+    app._open_diag(None, None)
+    assert len(spawned) == 2 and spawned[1][-2:] == ["gui", "--diag"]
 
 
 def test_autostart_exec_lleva_subcomando_app(monkeypatch, tmp_path):
     """El AppImage sin subcomando no abre nada: el autostart debe pasar `app`."""
-    from club_autotalplay import gui
+    from club_autotalplay import launch
     fake = tmp_path / "Club-AutotalPlay.AppImage"
     fake.write_text("")
-    monkeypatch.setattr(gui.os.path, "expanduser", lambda p: str(fake))
-    assert gui._autostart_exec() == f'"{fake}" app'
+    monkeypatch.setattr(launch, "APPIMAGE_DEFAULT", str(fake))
+    assert launch.autostart_exec() == f'"{fake}" app'
+
+
+def test_repair_autostart_corrige_exec_viejo(monkeypatch, tmp_path):
+    """Un .desktop de <=0.1.6 (sin `app`) se repara al arrancar; uno ausente no se crea."""
+    from club_autotalplay import launch
+    if launch.sys.platform.startswith("win"):
+        pytest.skip("autostart .desktop es de Linux")
+    fake = tmp_path / "Club-AutotalPlay.AppImage"
+    fake.write_text("")
+    desktop = tmp_path / "autostart" / "club-autotalplay.desktop"
+    monkeypatch.setattr(launch, "APPIMAGE_DEFAULT", str(fake))
+    monkeypatch.setattr(launch, "AUTOSTART_DESKTOP", str(desktop))
+    assert launch.repair_autostart() is False  # no existe: respeta "desactivado"
+    assert not desktop.exists()
+    desktop.parent.mkdir()
+    desktop.write_text(f"[Desktop Entry]\nExec={fake}\n")
+    assert launch.repair_autostart() is True
+    assert f'Exec="{fake}" app' in desktop.read_text().splitlines()
+    assert launch.repair_autostart() is False  # idempotente
+
+
+def test_tray_entry_pasa_argumentos_al_cli():
+    """El .exe de bandeja se relanza con `gui`: debe ir al CLI, no abrir otro tray."""
+    import pathlib
+    src = (pathlib.Path(__file__).parent.parent / "packaging" / "tray_entry.py").read_text()
+    assert "sys.argv[1:]" in src and "cli import main" in src
+
+
+def test_grant_sin_dns_actualiza_params_del_llamador(monkeypatch):
+    """Tras roaming, los params frescos llegan al llamador (que los cachea)."""
+    n = {"i": 0}
+
+    def once(p):
+        n["i"] += 1
+        return "dns" if n["i"] == 1 else True
+
+    monkeypatch.setattr(core, "_grant_session_once", once)
+    monkeypatch.setattr(core, "_wait_link", lambda d: ("captive", CAPTIVE_LOC))
+    params = {"ip": "viejo", "mac": "x", "nombreAcc": "y", "tipo": "DESKTOP"}
+    assert core.grant_session(params) is True
+    assert params == core.parse_portal_params(CAPTIVE_LOC)
+
+
+def test_link_recuperado_sin_grant_es_recovered(monkeypatch):
+    """DNS cae y el link vuelve solo: 'recovered', sin last_grant_ok ni sesion nueva."""
+    from club_autotalplay import daemon
+    monkeypatch.setattr(core, "probe", lambda: ("down", None))
+    monkeypatch.setattr(core, "current_ssid", lambda: core.SSID)
+    monkeypatch.setattr(core, "wifi_connected", lambda: True)
+    monkeypatch.setattr(core, "grant_session", lambda p: core.RECOVERED)
+    monkeypatch.setattr(core, "save_state", lambda s: None)
+    state = _fresh_state(last_portal_params=dict(PORTAL_PARAMS))
+    assert core.cycle(state) == "recovered"
+    assert state["last_grant_ok"] == ""
+    assert "recovered" in daemon._ONLINE_ACTIONS
+    assert "recovered" not in daemon._RESTORED_ACTIONS
+
+
+def test_reprobe_sin_grant_en_el_ciclo_es_recovered(monkeypatch):
+    """Grant en cooldown (no se mando nada) y el link vuelve: no es 'granted'."""
+    seq = iter([("down", None), ("online", None)])
+    monkeypatch.setattr(core, "probe", lambda: next(seq))
+    monkeypatch.setattr(core, "current_ssid", lambda: core.SSID)
+    monkeypatch.setattr(core, "wifi_connected", lambda: True)
+    monkeypatch.setattr(core, "save_state", lambda s: None)
+    state = _fresh_state(
+        last_portal_params=dict(PORTAL_PARAMS),
+        last_grant_attempt=core.now_iso(),  # cooldown activo, grant fallido
+    )
+    assert core.cycle(state) == "recovered"

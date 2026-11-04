@@ -18,15 +18,14 @@ pystray usa AppIndicator/ayatana si esta disponible).
 from __future__ import annotations
 
 import logging
-import os
 import subprocess
-import sys
 import threading
 import time
 
 from PIL import Image
 
 from . import core, daemon
+from .launch import open_path, repair_autostart, self_command
 from .assets import icon_path as _icon_path
 
 log = logging.getLogger("club_autotalplay.tray")
@@ -61,6 +60,7 @@ class TrayApp:
         self._stop = threading.Event()
         self._icon = None
         self._gui_proc = None
+        self._diag_proc = None
 
     # --- daemon existente ---------------------------------------------------
     @staticmethod
@@ -101,21 +101,28 @@ class TrayApp:
         # idempotente y hay cooldown en state.json)
         threading.Thread(target=daemon.run_once, daemon=True).start()
 
-    def _open_gui(self, *args, panel_args=()):
+    @staticmethod
+    def _spawn(proc, *args):
+        """Lanza `args` como proceso aparte salvo que `proc` siga vivo."""
+        if proc is not None and proc.poll() is None:
+            return proc  # ya abierto
+        try:
+            return subprocess.Popen(self_command(*args))
+        except Exception as e:
+            log.error("no pude abrir %s: %s", args, e)
+            return proc
+
+    def _open_gui(self, *args):
         """Abre el panel en un PROCESO aparte (una sola instancia).
 
         Antes se creaba tk.Tk() dentro del thread de pystray: Tkinter no es
         seguro fuera del thread principal y un segundo clic abria otra raiz.
         """
-        if self._gui_proc is not None and self._gui_proc.poll() is None:
-            return  # ya abierto
-        try:
-            self._gui_proc = subprocess.Popen(self_command("gui", *panel_args))
-        except Exception as e:
-            log.error("no pude abrir el panel: %s", e)
+        self._gui_proc = self._spawn(self._gui_proc, "gui")
 
     def _open_diag(self, *args):
-        self._open_gui(panel_args=("--diag",))
+        # proceso propio: con el panel ya abierto, el diagnostico no se pierde
+        self._diag_proc = self._spawn(self._diag_proc, "gui", "--diag")
 
     def _open_log(self, *args):
         open_path(core.LOG_PATH)
@@ -131,6 +138,7 @@ class TrayApp:
         from pystray import Menu, MenuItem
 
         core.setup_logging()
+        repair_autostart()
 
         # el daemon: solo se spawnea si no hay otro vivo (servicio systemd).
         # si ya corre uno, el tray solo lo observa (lee su state.json).
@@ -157,29 +165,6 @@ class TrayApp:
         threading.Thread(target=self._watcher_thread, daemon=True, name="watcher").start()
 
         self._icon.run()  # bloqueante; corre el loop del tray
-
-
-def self_command(*args):
-    """Comando para relanzar ESTA app con un subcomando del CLI."""
-    appimage = os.environ.get("APPIMAGE")
-    if appimage:
-        return [appimage, *args]
-    if getattr(sys, "frozen", False):  # .exe de PyInstaller
-        return [sys.executable, *args]
-    return [sys.executable, "-m", "club_autotalplay.cli", *args]
-
-
-def open_path(path):
-    """Abre un archivo con la app por defecto del sistema."""
-    try:
-        if sys.platform.startswith("win"):
-            os.startfile(path)  # type: ignore[attr-defined]
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", path])
-        else:
-            subprocess.Popen(["xdg-open", path])
-    except Exception as e:
-        log.error("no pude abrir %s: %s", path, e)
 
 
 def run():

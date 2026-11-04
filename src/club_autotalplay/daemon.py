@@ -168,9 +168,11 @@ def _cycle_lock(timeout=LOCK_TIMEOUT):
 
 
 # Acciones del ciclo que ya garantizan online verificado (sin re-probar).
-_ONLINE_ACTIONS = ("online", "granted", "granted-cached", "granted-after-bounce", "bounced")
+# "recovered" = el link volvio solo (roaming) sin grant: online, pero NO es
+# una sesion nueva, asi que no re-ancla la ventana de expiracion.
+_ONLINE_ACTIONS = ("online", "recovered", "granted", "granted-cached", "granted-after-bounce", "bounced")
 # Acciones que restauraron una sesion (no "online" a secas).
-_RESTORED_ACTIONS = _ONLINE_ACTIONS[1:]
+_RESTORED_ACTIONS = ("granted", "granted-cached", "granted-after-bounce", "bounced")
 
 
 def _refresh_state(state, action):

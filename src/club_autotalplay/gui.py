@@ -15,17 +15,18 @@ el daemon corre en su propio proceso/thread.
 from __future__ import annotations
 
 import logging
-import os
-import subprocess
 import threading
 import tkinter as tk
 from tkinter import ttk
 
 from . import core, daemon
+from .launch import autostart_enabled as _autostart_enabled
+from .launch import autostart_exec as _autostart_exec  # noqa: F401 (tests)
+from .launch import open_path, repair_autostart
+from .launch import set_autostart as _set_autostart
 
 log = logging.getLogger("club_autotalplay.gui")
 
-AUTOSTART_DESKTOP = os.path.expanduser("~/.config/autostart/club-autotalplay.desktop")
 _COLORS = {"online": "#22c55e", "reconnecting": "#eab308", "offline": "#ef4444"}
 
 
@@ -50,63 +51,16 @@ def _read_log_tail(n=12):
         return f"(sin log todavía: {e})"
 
 
-def _autostart_enabled():
-    return os.path.exists(AUTOSTART_DESKTOP)
-
-
-def _set_autostart(enabled):
-    if enabled:
-        os.makedirs(os.path.dirname(AUTOSTART_DESKTOP), exist_ok=True)
-        # apunta al launcher del sistema (script en PATH o AppImage)
-        exec_line = _autostart_exec()
-        content = (
-            "[Desktop Entry]\n"
-            "Type=Application\n"
-            "Name=Club-AutotalPlay\n"
-            "Comment=Auto-reconnect Club_Totalplay_WiFi\n"
-            f"Exec={exec_line}\n"
-            "Icon=club-autotalplay\n"
-            "Terminal=false\n"
-            "Categories=Network;\n"
-            "X-GNOME-Autostart-enabled=true\n"
-        )
-        with open(AUTOSTART_DESKTOP, "w") as f:
-            f.write(content)
-    else:
-        try:
-            os.remove(AUTOSTART_DESKTOP)
-        except FileNotFoundError:
-            pass
-
-
-def _autostart_exec():
-    """Que comando lanzar al arrancar la sesion.
-
-    Prefiere el AppImage si existe (M3); si no, el launcher del venv.
-    """
-    # Siempre con el subcomando `app`: el CLI exige uno y el AppImage sin
-    # argumentos sale con error (el autostart no mostraba nada). Rutas entre
-    # comillas: la del repo lleva espacios ("ISyCo Git").
-    appimage = os.path.expanduser("~/.local/bin/Club-AutotalPlay.AppImage")
-    if os.path.exists(appimage):
-        return f'"{appimage}" app'
-    # venv del repo (desarrollo)
-    venv_bin = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "..", ".venv", "bin", "club-autotalplay")
-    )
-    if os.path.exists(venv_bin):
-        return f'"{venv_bin}" app'
-    return "club-autotalplay app"
-
-
 class GuiWindow:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Club-AutotalPlay")
         self.root.resizable(False, False)
         self._stop = threading.Event()
-        # resultados de threads de trabajo: Tk solo se toca desde _refresh
+        # resultados de threads de trabajo: Tk solo se toca desde el thread
+        # principal (_drain_pending); los workers solo escriben este dict.
         self._pending = {}
+        self._workers = []
         self._build()
         self._refresh()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -194,13 +148,19 @@ class GuiWindow:
                 self._pending[key] = fn()
             except Exception as e:
                 self._pending[key] = f"error: {e}"
-        threading.Thread(target=work, daemon=True).start()
+        # NO daemon: si se cierra la ventana a media reconexion (entre
+        # `radio wifi off` y `on`), el proceso espera a que el ciclo termine
+        # en vez de matarlo y dejar el WiFi apagado.
+        t = threading.Thread(target=work, daemon=False)
+        t.start()
+        self._workers.append(t)
         self.root.after(300, self._poll_pending)
 
     def _poll_pending(self):
-        if self._pending:
-            self._drain_pending()
-        elif not self._stop.is_set():
+        """Sondeo corto mientras haya un worker vivo; se apaga solo."""
+        self._drain_pending()
+        self._workers = [t for t in self._workers if t.is_alive()]
+        if (self._workers or self._pending) and not self._stop.is_set():
             self.root.after(300, self._poll_pending)
 
     def _reconnect(self):
@@ -217,7 +177,6 @@ class GuiWindow:
         self._run_bg("diag", lambda: core.debug_dump(perform_grant=False, redact=True))
 
     def _open_log(self):
-        from .tray import open_path
         open_path(core.LOG_PATH)
 
     def _show_text(self, title, text):
@@ -239,7 +198,9 @@ class GuiWindow:
 
     def _on_close(self):
         self._stop.set()
-        self.root.destroy()
+        if any(t.is_alive() for t in self._workers):
+            log.info("panel cerrado con un ciclo en curso; se termina antes de salir")
+        self.root.destroy()  # los workers no-daemon terminan su ciclo
 
     def run(self):
         self.root.mainloop()
@@ -259,6 +220,7 @@ _ACTION_TEXT = {
 
 def open_window(diag=False):
     """Abre la GUI (thread principal de tkinter)."""
+    repair_autostart()
     win = GuiWindow()
     if diag:
         win.root.after(100, win.diagnose)

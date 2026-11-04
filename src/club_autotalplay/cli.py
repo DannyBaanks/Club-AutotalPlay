@@ -103,6 +103,9 @@ def _cmd_tray(args):
 
 def _cmd_gui(args):
     """Solo la GUI (lector de estado); el daemon debe correr aparte o via tray."""
+    # El panel es su propio proceso: sin esto, "Reconectar ahora" corre el
+    # ciclo completo (grant/bounce) sin dejar rastro en watchdog.log.
+    core.setup_logging(to_stdout=False)
     from . import gui
     gui.run_app(diag=getattr(args, "diag", False))
     return 0
