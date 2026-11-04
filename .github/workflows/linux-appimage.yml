@@ -18,7 +18,11 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Fijo en 22.04 (glibc 2.35), NO ubuntu-latest: PyInstaller empaqueta las
+    # libs del runner (libtcl/libtk) y con un runner nuevo exigian GLIBC_2.42
+    # -> el panel (Tk) tronaba en Ubuntu 24.04 (glibc 2.39). Un AppImage corre
+    # en distros con glibc >= la del build, asi que se compila en la vieja.
+    runs-on: ubuntu-22.04
     permissions:
       contents: read
     steps:
@@ -31,7 +35,7 @@ jobs:
       - name: Instalar squashfs-tools + FUSE (para correr el AppImage)
         run: |
           sudo apt-get update
-          sudo apt-get install -y squashfs-tools libfuse2t64
+          sudo apt-get install -y squashfs-tools libfuse2 xvfb
 
       - name: Descargar runtime oficial AppImageKit (Type2, x86_64)
         run: |
@@ -59,6 +63,16 @@ jobs:
         run: |
           ls -la dist/
           ./dist/Club-AutotalPlay-x86_64.AppImage status
+
+      - name: Smoke test AppImage (panel Tk abre)
+        # El panel debe quedarse abierto hasta el timeout (rc 124). Cualquier
+        # otro rc = truena al importar Tk (p.ej. libs con glibc mas nueva).
+        run: |
+          set +e
+          xvfb-run -a timeout 8 ./dist/Club-AutotalPlay-x86_64.AppImage gui
+          rc=$?
+          echo "rc=$rc"
+          test "$rc" -eq 124
 
       - name: Guardar artifact (siempre)
         uses: actions/upload-artifact@v4
