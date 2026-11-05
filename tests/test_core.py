@@ -1127,3 +1127,103 @@ def test_reprobe_sin_grant_en_el_ciclo_es_recovered(monkeypatch):
         last_grant_attempt=core.now_iso(),  # cooldown activo, grant fallido
     )
     assert core.cycle(state) == "recovered"
+
+
+# ---------------------------------------------------------------------------
+# tray xorg: nada de grab_server (congelaba GNOME al cerrar la tapa, 2026-11-04)
+# ---------------------------------------------------------------------------
+
+def test_patch_xorg_quita_grab_server(monkeypatch):
+    import sys
+    import types
+    from club_autotalplay import tray
+
+    calls = []
+
+    class Owner:
+        id = 42
+
+    class FakeDisplay:
+        def __init__(self, owner):
+            self.owner = owner
+
+        def grab_server(self):
+            calls.append("grab")
+
+        def ungrab_server(self):
+            calls.append("ungrab")
+
+        def flush(self):
+            pass
+
+        def get_selection_owner(self, atom):
+            calls.append(("owner", atom))
+            return self.owner
+
+        def create_resource_object(self, kind, rid):
+            return (kind, rid)
+
+    class Icon:  # la forma de pystray._xorg.Icon que importa
+        def _get_systray_manager(self):
+            self._display.grab_server()
+            raise AssertionError("no debe usarse el original")
+
+    fake = types.ModuleType("pystray._xorg")
+    fake.Icon = Icon
+    monkeypatch.setitem(sys.modules, "pystray._xorg", fake)
+    monkeypatch.setitem(sys.modules, "pystray", types.ModuleType("pystray"))
+    sys.modules["pystray"]._xorg = fake
+
+    assert tray._patch_xorg_no_grab() is True
+    icon = Icon()
+    icon._net_system_tray_sx = 7
+    icon._display = FakeDisplay(Owner())
+    assert icon._get_systray_manager() == ("window", 42)
+    import Xlib.X
+    icon._display = FakeDisplay(Xlib.X.NONE)
+    assert icon._get_systray_manager() is None  # sin bandeja: None, no excepcion
+    assert "grab" not in calls and "ungrab" not in calls
+    assert calls == [("owner", 7), ("owner", 7)]
+
+
+def test_patch_xorg_no_adivina_si_pystray_cambio(monkeypatch):
+    import sys
+    import types
+    from club_autotalplay import tray
+    fake = types.ModuleType("pystray._xorg")
+    fake.Icon = type("Icon", (), {})  # sin _get_systray_manager
+    monkeypatch.setitem(sys.modules, "pystray._xorg", fake)
+    monkeypatch.setitem(sys.modules, "pystray", types.ModuleType("pystray"))
+    sys.modules["pystray"]._xorg = fake
+    assert tray._patch_xorg_no_grab() is False
+    assert not hasattr(fake.Icon, "_get_systray_manager")
+
+
+def test_watcher_solo_actualiza_icono_si_cambia_el_estado(monkeypatch):
+    """Antes reasignaba icono+titulo cada 2 s: cada asignacion re-dockaba en X."""
+    from club_autotalplay import tray
+
+    states = [{"online": True}] * 3 + [{"online": False}] * 2 + [{"online": True}]
+    sets = []
+
+    class FakeIcon:
+        def __setattr__(self, k, v):
+            sets.append(k)
+
+    app = tray.TrayApp()
+    app._icon = FakeIcon()
+    it = iter(states)
+
+    def load_state():
+        try:
+            return next(it)
+        except StopIteration:
+            app._stop.set()
+            return states[-1]
+
+    monkeypatch.setattr(tray.core, "load_state", load_state)
+    monkeypatch.setattr(tray.Image, "open", lambda p: p)
+    monkeypatch.setattr(app._stop, "wait", lambda t: None)
+    app._watcher_thread()
+    # 3 cambios reales (online -> offline -> online), 2 asignaciones cada uno
+    assert sets == ["icon", "title"] * 3

@@ -55,6 +55,36 @@ def _title(state):
     return f"Club-AutotalPlay — {ssid} (sin conexión)"
 
 
+def _patch_xorg_no_grab():
+    """Quita el grab_server() del backend xorg de pystray. True si parcheo.
+
+    pystray._xorg._get_systray_manager hace grab_server() para preguntar
+    quien es la bandeja: mientras dura, NINGUN otro cliente X (ni gnome-shell)
+    puede dibujar. Si la bandeja no existe (GNOME al bloquear la pantalla)
+    pystray lo reintenta en cada actualizacion. Con eso, cerrar la tapa dejaba
+    todo congelado menos el mouse (2026-11-04, confirmado matando el tray).
+    El grab solo evita una carrera teorica entre leer el dueño y pedir el
+    dock; si el dueño muere en medio, pystray re-docka con DestroyNotify.
+    """
+    try:
+        import pystray._xorg as xorg
+        import Xlib.X
+    except Exception:
+        return False  # otro backend (win32, appindicator) o sin python-xlib
+    cls = getattr(xorg, "Icon", None)
+    if cls is None or not hasattr(cls, "_get_systray_manager"):
+        return False  # pystray cambio por dentro: no adivinar
+
+    def _get_systray_manager(self):
+        owner = self._display.get_selection_owner(self._net_system_tray_sx)
+        if owner != Xlib.X.NONE:
+            return self._display.create_resource_object("window", owner.id)
+        return None
+
+    cls._get_systray_manager = _get_systray_manager
+    return True
+
+
 class TrayApp:
     def __init__(self):
         self._stop = threading.Event()
@@ -82,15 +112,22 @@ class TrayApp:
         daemon.run(poll=core.POLL_SECONDS)
 
     def _watcher_thread(self):
-        """Lee state.json y actualiza el icono del tray cada 2 s."""
-        import pystray
+        """Lee state.json cada 2 s y actualiza el icono SOLO si cambio.
+
+        Cada asignacion a icon/title es un viaje al mainloop de pystray; en
+        el backend xorg eso re-docka el icono (antes con grab_server). Antes
+        se reasignaba cada 2 s aunque nada cambiara: GNOME se congelaba al
+        cerrar la tapa (2026-11-04). Ver _patch_xorg_no_grab.
+        """
+        shown = None
         while not self._stop.is_set():
             state = core.load_state()
-            name = _state_name(state)
-            if self._icon is not None:
+            want = (_state_name(state), _title(state))
+            if self._icon is not None and want != shown:
                 try:
-                    self._icon.icon = Image.open(_icon_path(name))
-                    self._icon.title = _title(state)
+                    self._icon.icon = Image.open(_icon_path(want[0]))
+                    self._icon.title = want[1]
+                    shown = want
                 except Exception as e:
                     log.debug("no pude actualizar icono: %s", e)
             self._stop.wait(2.0)
@@ -139,6 +176,8 @@ class TrayApp:
 
         core.setup_logging()
         repair_autostart()
+        if _patch_xorg_no_grab():
+            log.info("tray xorg: sin grab_server")
 
         # el daemon: solo se spawnea si no hay otro vivo (servicio systemd).
         # si ya corre uno, el tray solo lo observa (lee su state.json).
