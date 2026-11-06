@@ -1,3 +1,14 @@
+> [!IMPORTANT]
+> **Aviso sobre el video del portal cautivo de Totalplay**
+>
+> Club-AutotalPlay **no pretende evadir una verificación de visualización del anuncio**. En las pruebas realizadas con `Club_Totalplay_WiFi`, el portal en computadora permite renovar la sesión **sin exigir una prueba técnica de haber visto el video**: no se observó un token de reproducción, una comprobación de progreso ni una validación obligatoria de finalización. En el flujo móvil probado tampoco se exigió terminar el video para continuar.
+>
+> **Qué hace hoy:** la aplicación automatiza la solicitud de renovación que el servidor acepta, **sin reproducir el video**. No afirma haberlo mostrado ni haber superado una verificación audiovisual. Esto describe únicamente el comportamiento observado del portal; **no demuestra que no existan otros controles ni equivale a una autorización o exención de los términos de Totalplay**.
+>
+> **Compromiso ante cambios:** si Totalplay implementa una verificación efectiva que condicione el acceso a ver el anuncio, **no intentaremos eludirla**. Adaptaremos Club-AutotalPlay para reproducir el video completo antes de renovar la sesión, posiblemente en un mini reproductor discreto, o suspenderemos esa automatización hasta poder cumplir con el requisito.
+
+---
+
 <div align="center">
 
 # Club-AutotalPlay
