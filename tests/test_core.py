@@ -1199,6 +1199,80 @@ def test_patch_xorg_no_adivina_si_pystray_cambio(monkeypatch):
     assert not hasattr(fake.Icon, "_get_systray_manager")
 
 
+def test_patch_xorg_retira_el_icono_sin_bandeja(monkeypatch):
+    """Sin bandeja (pantalla bloqueada) la ventana se desmapea y no se pinta.
+
+    Mapeada en la raiz, mutter la enmarcaba/desmapeaba en ciclo (Xorg al
+    100 %, GNOME congelado al bloquear; 2026-11-14).
+    """
+    import sys
+    import types
+    import Xlib.X
+    from club_autotalplay import tray
+
+    calls = []
+
+    class Win:
+        def __init__(self, wid):
+            self.id = wid
+
+        def unmap(self):
+            calls.append("unmap")
+
+    class FakeDisplay:
+        owner = Xlib.X.NONE
+
+        def flush(self):
+            calls.append("flush")
+
+        def get_selection_owner(self, atom):
+            return self.owner
+
+        def create_resource_object(self, kind, rid):
+            return Win(rid)
+
+    class Icon:
+        def _get_systray_manager(self):
+            raise AssertionError("no debe usarse el original")
+
+        def _dock_window(self):
+            m = self._get_systray_manager()
+            if m:
+                self._systray_manager = m
+                calls.append("dock")
+
+        def _on_destroy_notify(self, event):
+            raise AssertionError("no debe usarse el original")
+
+        def _update_icon(self):
+            calls.append("draw")
+
+    fake = types.ModuleType("pystray._xorg")
+    fake.Icon = Icon
+    monkeypatch.setitem(sys.modules, "pystray._xorg", fake)
+    monkeypatch.setitem(sys.modules, "pystray", types.ModuleType("pystray"))
+    sys.modules["pystray"]._xorg = fake
+    assert tray._patch_xorg_no_grab() is True
+
+    icon = Icon()
+    icon._net_system_tray_sx = 7
+    icon._display = FakeDisplay()
+    icon._window = Win(1)
+    icon._systray_manager = Win(99)
+    ev = types.SimpleNamespace(window=Win(5))
+    icon._on_destroy_notify(ev)            # otra ventana: nada
+    assert calls == [] and icon._systray_manager.id == 99
+    ev.window = Win(99)
+    icon._on_destroy_notify(ev)            # murio la bandeja: retirar
+    assert icon._systray_manager is None
+    assert calls == ["unmap", "flush"]
+    icon._update_icon()                    # sin bandeja: ni dock ni dibujo
+    assert calls == ["unmap", "flush"]
+    icon._display.owner = types.SimpleNamespace(id=77)   # volvio la bandeja
+    icon._update_icon()
+    assert calls == ["unmap", "flush", "draw"]
+
+
 def test_watcher_solo_actualiza_icono_si_cambia_el_estado(monkeypatch):
     """Antes reasignaba icono+titulo cada 2 s: cada asignacion re-dockaba en X."""
     from club_autotalplay import tray

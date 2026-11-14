@@ -82,6 +82,49 @@ def _patch_xorg_no_grab():
         return None
 
     cls._get_systray_manager = _get_systray_manager
+    _patch_xorg_withdraw_when_orphan(cls)
+    return True
+
+
+def _patch_xorg_withdraw_when_orphan(cls):
+    """Sin bandeja, el icono se retira (unmap) y espera callado.
+
+    Al bloquear la pantalla GNOME destruye la bandeja; X devuelve nuestra
+    ventana 24x24 a la raiz y la deja MAPEADA. Mutter la toma como ventana
+    normal y entra en un ciclo enmarcar/mapear/desmapear/destruir (~12 Hz,
+    Xorg al 80-100 % de CPU): la pantalla de bloqueo nunca termina y todo
+    queda congelado menos el mouse (medido en vivo 2026-11-14 con xev;
+    matar solo el tray bajo Xorg de 100 % a 0 %).
+    """
+    orig_destroy = getattr(cls, "_on_destroy_notify", None)
+    orig_update = getattr(cls, "_update_icon", None)
+    if orig_destroy is None or orig_update is None:
+        return False  # pystray cambio por dentro: no adivinar
+
+    def _withdraw(self):
+        try:
+            self._window.unmap()
+            self._display.flush()
+        except Exception as e:  # la ventana pudo morir; no tumbar el mainloop
+            log.debug("no pude retirar el icono: %s", e)
+
+    def _on_destroy_notify(self, event):
+        manager = self._systray_manager
+        if manager is None or event.window.id != manager.id:
+            return
+        self._systray_manager = None
+        self._dock_window()  # ¿ya hay otra bandeja? (sin grab)
+        if not self._systray_manager:
+            _withdraw(self)
+            log.info("tray xorg: bandeja desaparecio; icono retirado")
+
+    def _update_icon(self):
+        if not self._systray_manager and self._get_systray_manager() is None:
+            return  # sin bandeja (pantalla bloqueada): seguir retirado
+        orig_update(self)
+
+    cls._on_destroy_notify = _on_destroy_notify
+    cls._update_icon = _update_icon
     return True
 
 
@@ -120,9 +163,16 @@ class TrayApp:
         cerrar la tapa (2026-11-04). Ver _patch_xorg_no_grab.
         """
         shown = None
+        ticks = 0
         while not self._stop.is_set():
             state = core.load_state()
             want = (_state_name(state), _title(state))
+            ticks += 1
+            # backend xorg sin bandeja (pantalla bloqueada): reintenta el dock
+            # cada ~6 s; _update_icon parcheado no hace nada si aun no hay.
+            if (shown is not None and ticks % 3 == 0
+                    and getattr(self._icon, "_systray_manager", True) is None):
+                shown = None
             if self._icon is not None and want != shown:
                 try:
                     self._icon.icon = Image.open(_icon_path(want[0]))
