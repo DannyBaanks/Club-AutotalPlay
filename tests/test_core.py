@@ -1134,6 +1134,7 @@ def test_reprobe_sin_grant_en_el_ciclo_es_recovered(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_patch_xorg_quita_grab_server(monkeypatch):
+    pytest.importorskip("Xlib")  # backend xorg: solo Linux (en Windows no hay python-xlib)
     import sys
     import types
     from club_autotalplay import tray
@@ -1205,6 +1206,7 @@ def test_patch_xorg_retira_el_icono_sin_bandeja(monkeypatch):
     Mapeada en la raiz, mutter la enmarcaba/desmapeaba en ciclo (Xorg al
     100 %, GNOME congelado al bloquear; 2026-11-14).
     """
+    pytest.importorskip("Xlib")  # backend xorg: solo Linux
     import sys
     import types
     import Xlib.X
