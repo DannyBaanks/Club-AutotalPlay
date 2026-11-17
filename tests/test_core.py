@@ -280,6 +280,108 @@ def test_bring_up_wifi_sin_red(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# interlock con wifihost: con hotspot activo el radio no se apaga primero
+# ---------------------------------------------------------------------------
+
+def _run_ok_factory(runs):
+    def fake_run(cmd, timeout=15):
+        runs.append(cmd)
+        class R:
+            returncode, stdout, stderr = 0, "ok", ""
+        return R()
+    return fake_run
+
+
+def _hotspot_state(tmp_path, monkeypatch, content="SCENARIO=B\nAP_IF=ap0\nUP=wlo1\n"):
+    st = tmp_path / "wifihost" / "state"
+    st.parent.mkdir(parents=True)
+    st.write_text(content)
+    monkeypatch.setattr(core, "HOTSPOT_STATE_PATH", str(st))
+    return st
+
+
+def test_hotspot_active_lee_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "HOTSPOT_STATE_PATH", str(tmp_path / "state"))
+    assert core.hotspot_active() is False
+    (tmp_path / "state").write_text("SCENARIO=B\nAP_IF=ap0\n")
+    assert core.hotspot_active() is True
+    (tmp_path / "state").write_text("SCENARIO=A\n")   # sin AP propio
+    assert core.hotspot_active() is False
+
+
+def test_interlock_activo_no_apaga_radio(monkeypatch, tmp_path):
+    """Con hotspot activo e interlock on: connection up, nunca radio off."""
+    monkeypatch.setattr(core, "IS_WINDOWS", False)
+    monkeypatch.setattr(core, "current_ssid", lambda: core.SSID)
+    monkeypatch.setattr(core, "wifi_connected", lambda: True)
+    _hotspot_state(tmp_path, monkeypatch)
+    monkeypatch.delenv(core.INTERLOCK_ENV, raising=False)  # default: activo
+    runs = []
+    monkeypatch.setattr(core, "_run", _run_ok_factory(runs))
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+
+    assert core.bring_up_wifi() is True
+    assert ["nmcli", "connection", "up", core.SSID] in runs
+    assert ["nmcli", "radio", "wifi", "off"] not in runs
+
+
+def test_interlock_kill_switch_usa_radio(monkeypatch, tmp_path):
+    """CLUB_AUTOTALPLAY_INTERLOCK=0 restaura el comportamiento historico."""
+    monkeypatch.setattr(core, "IS_WINDOWS", False)
+    monkeypatch.setattr(core, "current_ssid", lambda: core.SSID)
+    monkeypatch.setattr(core, "wifi_connected", lambda: True)
+    _hotspot_state(tmp_path, monkeypatch)
+    monkeypatch.setenv(core.INTERLOCK_ENV, "0")
+    runs = []
+    monkeypatch.setattr(core, "_run", _run_ok_factory(runs))
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+
+    assert core.bring_up_wifi() is True
+    assert ["nmcli", "radio", "wifi", "off"] in runs
+
+
+def test_interlock_sin_hotspot_usa_radio(monkeypatch, tmp_path):
+    """Sin estado de wifihost, el interlock no aplica (camino historico)."""
+    monkeypatch.setattr(core, "IS_WINDOWS", False)
+    monkeypatch.setattr(core, "current_ssid", lambda: core.SSID)
+    monkeypatch.setattr(core, "wifi_connected", lambda: True)
+    monkeypatch.setattr(core, "HOTSPOT_STATE_PATH", str(tmp_path / "no-existe"))
+    monkeypatch.delenv(core.INTERLOCK_ENV, raising=False)
+    runs = []
+    monkeypatch.setattr(core, "_run", _run_ok_factory(runs))
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+
+    assert core.bring_up_wifi() is True
+    assert ["nmcli", "radio", "wifi", "off"] in runs
+
+
+def test_interlock_fallback_a_radio_si_connection_up_falla(monkeypatch, tmp_path):
+    """Si la via suave falla, cae al bounce de radio: nunca sin internet."""
+    monkeypatch.setattr(core, "IS_WINDOWS", False)
+    monkeypatch.setattr(core, "current_ssid", lambda: core.SSID)
+    _hotspot_state(tmp_path, monkeypatch)
+    monkeypatch.delenv(core.INTERLOCK_ENV, raising=False)
+    runs = []
+
+    def fake_run(cmd, timeout=15):
+        runs.append(cmd)
+        class R:
+            pass
+        r = R()
+        r.returncode = 1 if cmd[:2] == ["nmcli", "connection"] else 0
+        r.stdout, r.stderr = "", "falla simulada"
+        return r
+
+    monkeypatch.setattr(core, "_run", fake_run)
+    monkeypatch.setattr(core, "_wait_wifi_connected", lambda deadline: False)
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+
+    assert core.bring_up_wifi() is False
+    assert ["nmcli", "connection", "up", core.SSID] in runs   # suave, primero
+    assert ["nmcli", "radio", "wifi", "off"] in runs          # ultimo recurso
+
+
+# ---------------------------------------------------------------------------
 # wifi_device: detección dinámica
 # ---------------------------------------------------------------------------
 

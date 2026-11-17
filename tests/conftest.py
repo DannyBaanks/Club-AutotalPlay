@@ -21,6 +21,11 @@ def _rutas_aisladas(tmp_path, monkeypatch):
     monkeypatch.setattr(core, "STATE_DIR", str(state_dir))
     monkeypatch.setattr(core, "STATE_PATH", os.path.join(state_dir, "state.json"))
     monkeypatch.setattr(core, "LOG_PATH", os.path.join(state_dir, "watchdog.log"))
+    # Sin esto, en una maquina CON hotspot activo (wifihost) los tests de
+    # bring_up_wifi verian hotspot_active()=True y el interlock cambiaria el
+    # camino esperado. Apuntamos a una ruta inexistente: sin hotspot.
+    monkeypatch.setattr(core, "HOTSPOT_STATE_PATH", str(tmp_path / "no-hotspot" / "state"))
+    monkeypatch.delenv(core.INTERLOCK_ENV, raising=False)
     logger = logging.getLogger("club_autotalplay")
     previos = list(logger.handlers)
     yield

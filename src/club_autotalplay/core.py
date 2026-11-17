@@ -73,6 +73,16 @@ else:
 LOG_PATH = os.path.join(STATE_DIR, "watchdog.log")
 STATE_PATH = os.path.join(STATE_DIR, "state.json")
 
+# --- Interlock con hotspot propio (wifihost) -------------------------------
+# Si hay un AP propio corriendo sobre el MISMO phy (wifihost deja su estado en
+# /run/wifihost/state), `nmcli radio wifi off` es un rfkill del phy COMPLETO:
+# tumba el uplink y el AP a la vez (el telefono pierde WiFi ~10-15 s por bounce).
+# Con el interlock activo el bounce de radio pasa a ser ULTIMO recurso: primero
+# se intenta `nmcli connection up`, que no apaga el radio.
+# Kill-switch sin revertir: CLUB_AUTOTALPLAY_INTERLOCK=0
+HOTSPOT_STATE_PATH = "/run/wifihost/state"
+INTERLOCK_ENV = "CLUB_AUTOTALPLAY_INTERLOCK"
+
 log = logging.getLogger("club_autotalplay")
 
 
@@ -556,6 +566,36 @@ def current_ssid():
         return None
 
 
+def interlock_enabled():
+    """True salvo que CLUB_AUTOTALPLAY_INTERLOCK=0 (kill-switch)."""
+    return os.environ.get(INTERLOCK_ENV, "1") != "0"
+
+
+def hotspot_active():
+    """True si wifihost tiene un AP activo en esta maquina.
+
+    El estado vive en /run (tmpfs): sin hotspot, o con wifihost detenido, el
+    fichero no existe y el interlock no aplica (comportamiento historico).
+    """
+    try:
+        if not os.path.exists(HOTSPOT_STATE_PATH):
+            return False
+        with open(HOTSPOT_STATE_PATH, "r", encoding="utf-8") as f:
+            return "AP_IF=" in f.read()
+    except OSError:
+        return False
+
+
+def _wait_wifi_connected(deadline):
+    """Sondea wifi_connected() hasta que conecte o se acabe el tiempo."""
+    end = time.time() + deadline
+    while time.time() < end:
+        if wifi_connected():
+            return True
+        time.sleep(2)
+    return wifi_connected()
+
+
 def bring_up_wifi():
     # Guard: si hay un WiFi conectado a OTRA red, no tocamos nada.
     # Apagar el radio o forzar `connection up` mataria la conexion que el
@@ -580,20 +620,41 @@ def bring_up_wifi():
             return True
         log.error("netsh fallo rc=%s out=%s err=%s", r.returncode, r.stdout.strip(), r.stderr.strip())
         return False
+    # Linux.
+    # Interlock: con un hotspot propio sobre el mismo phy NO apagamos el radio
+    # primero. `nmcli radio wifi off` bloquea todo el phy (rfkill) y tumba el
+    # AP junto con el uplink. Se prueba `connection up` (suave) y solo si falla
+    # se cae al toggle de radio como ULTIMO recurso: nunca nos quedamos sin
+    # internet por respetar al hotspot.
+    if interlock_enabled() and hotspot_active():
+        t0 = time.time()
+        log.info(
+            "interlock: hotspot activo (%s); pruebo 'connection up' sin apagar el radio",
+            HOTSPOT_STATE_PATH,
+        )
+        r = _run(["nmcli", "connection", "up", SSID], timeout=45)
+        if r.returncode == 0 and _wait_wifi_connected(30):
+            log.info(
+                "interlock: WiFi OK en %.1fs SIN rfkill (radio y AP intactos)",
+                time.time() - t0,
+            )
+            return True
+        log.warning(
+            "interlock: 'connection up' no basto (rc=%s); ULTIMO recurso: bounce de radio (el hotspot se caera)",
+            r.returncode,
+        )
     # Linux: toggle de radio (el MISMO que el toggle manual del usuario).
     # `nmcli connection up` a veces falla con "Causa desconocida" cuando el AP
     # no esta en el escaneo; apagar/prender el radio siempre reconecta.
+    t0 = time.time()
     log.info("re-boteando WiFi: nmcli radio wifi off/on")
     _run(["nmcli", "radio", "wifi", "off"])
     time.sleep(2)
     _run(["nmcli", "radio", "wifi", "on"])
     # esperar a que NetworkManager reconecte a la red conocida
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        if wifi_connected():
-            log.info("WiFi OK (radio re-botado y reconnectado)")
-            return True
-        time.sleep(2)
+    if _wait_wifi_connected(30):
+        log.info("WiFi OK (radio re-botado y reconnectado) en %.1fs", time.time() - t0)
+        return True
     # fallback por si el radio no basto
     log.warning("radio toggle no reconectó en 30s; intento connection up")
     r = _run(["nmcli", "connection", "up", SSID], timeout=45)
