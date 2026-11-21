@@ -152,7 +152,10 @@ POST https://clubwifi.totalplay.com.mx/ClubMovil/video-completado
    el portal corta la sesión).
 2. Si responde `302` (hubo corte), parsea IP / MAC / `accname` del `Location`.
 3. Manda el `POST` → `204` = sesión otorgada.
-4. Si no basta, re-botea el WiFi (`nmcli` en Linux, `netsh` en Windows).
+4. Si no basta, activa el perfil (`nmcli connection up` en Linux) sin apagar
+   el radio; el re-boteo del radio queda como último recurso. En Windows usa
+   `netsh`. Solo acepta la recuperación si el SSID real sigue siendo
+   `Club_Totalplay_WiFi`; si cambias a otra red, no insiste.
 
 > **Aviso:** el `204` prueba que el servidor acepta la solicitud; no prueba que
 > automatizarlo de forma indefinida esté permitido por los Términos de

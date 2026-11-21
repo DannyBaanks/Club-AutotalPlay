@@ -587,13 +587,26 @@ def hotspot_active():
 
 
 def _wait_wifi_connected(deadline):
-    """Sondea wifi_connected() hasta que conecte o se acabe el tiempo."""
+    """Espera conexion a NUESTRA red; una red ajena aborta la espera.
+
+    ``wifi_connected()`` solo dice que ALGUN WiFi quedó activo. Tras un
+    toggle del radio NetworkManager puede auto-conectar otro perfil conocido;
+    aceptarlo hacia que el daemon declarara ``bounced`` estando en otra red.
+    """
     end = time.time() + deadline
     while time.time() < end:
         if wifi_connected():
-            return True
+            ssid = current_ssid()
+            if ssid == SSID:
+                return True
+            if ssid and ssid != SSID:
+                log.warning(
+                    "WiFi conecto a otra red (%r != %r); no la confundo con una recuperacion",
+                    ssid, SSID,
+                )
+                return False
         time.sleep(2)
-    return wifi_connected()
+    return wifi_connected() and current_ssid() == SSID
 
 
 def bring_up_wifi():
@@ -620,48 +633,54 @@ def bring_up_wifi():
             return True
         log.error("netsh fallo rc=%s out=%s err=%s", r.returncode, r.stdout.strip(), r.stderr.strip())
         return False
-    # Linux.
-    # Interlock: con un hotspot propio sobre el mismo phy NO apagamos el radio
-    # primero. `nmcli radio wifi off` bloquea todo el phy (rfkill) y tumba el
-    # AP junto con el uplink. Se prueba `connection up` (suave) y solo si falla
-    # se cae al toggle de radio como ULTIMO recurso: nunca nos quedamos sin
-    # internet por respetar al hotspot.
-    if interlock_enabled() and hotspot_active():
+    # Linux: primero activar el perfil objetivo SIN apagar el radio. Ademas de
+    # preservar un hotspot propio, evita que NetworkManager auto-conecte otro
+    # perfil conocido al volver el rfkill (observado con DANNY 9882/TP-Link).
+    # La unica excepcion es el kill-switch explicito del interlock con hotspot.
+    hotspot = hotspot_active()
+    if interlock_enabled() or not hotspot:
         t0 = time.time()
-        log.info(
-            "interlock: hotspot activo (%s); pruebo 'connection up' sin apagar el radio",
-            HOTSPOT_STATE_PATH,
-        )
+        if hotspot:
+            log.info(
+                "interlock: hotspot activo (%s); pruebo 'connection up' sin apagar el radio",
+                HOTSPOT_STATE_PATH,
+            )
+        else:
+            log.info("levantando %s con 'nmcli connection up' (radio intacto)", SSID)
         r = _run(["nmcli", "connection", "up", SSID], timeout=45)
         if r.returncode == 0 and _wait_wifi_connected(30):
-            log.info(
-                "interlock: WiFi OK en %.1fs SIN rfkill (radio y AP intactos)",
-                time.time() - t0,
-            )
+            log.info("WiFi OK en %.1fs SIN rfkill", time.time() - t0)
             return True
-        log.warning(
-            "interlock: 'connection up' no basto (rc=%s); ULTIMO recurso: bounce de radio (el hotspot se caera)",
-            r.returncode,
-        )
-    # Linux: toggle de radio (el MISMO que el toggle manual del usuario).
-    # `nmcli connection up` a veces falla con "Causa desconocida" cuando el AP
-    # no esta en el escaneo; apagar/prender el radio siempre reconecta.
+        log.warning("'connection up' no basto (rc=%s)", r.returncode)
+        # El usuario pudo cambiar de red mientras nmcli esperaba. No pelear
+        # contra esa decision con un rfkill ni con otra activacion.
+        if _connected_to_other_ssid():
+            return False
+        if hotspot:
+            log.warning("interlock: ULTIMO recurso: bounce de radio (el hotspot se caera)")
+    # Toggle de radio como ULTIMO recurso. `connection up` puede fallar cuando
+    # el AP no aparece en el escaneo; el toggle fuerza una asociacion nueva.
     t0 = time.time()
     log.info("re-boteando WiFi: nmcli radio wifi off/on")
     _run(["nmcli", "radio", "wifi", "off"])
     time.sleep(2)
     _run(["nmcli", "radio", "wifi", "on"])
-    # esperar a que NetworkManager reconecte a la red conocida
     if _wait_wifi_connected(30):
         log.info("WiFi OK (radio re-botado y reconnectado) en %.1fs", time.time() - t0)
         return True
-    # fallback por si el radio no basto
-    log.warning("radio toggle no reconectó en 30s; intento connection up")
+    # Si NM eligio otra red al volver el radio, respetarla. Si siguio sin red,
+    # un ultimo `connection up` dirigido evita esperar al autoconnect.
+    if _connected_to_other_ssid():
+        return False
+    log.warning("radio toggle no reconectó %s; reintento connection up", SSID)
     r = _run(["nmcli", "connection", "up", SSID], timeout=45)
-    if r.returncode == 0:
+    if r.returncode == 0 and _wait_wifi_connected(30):
         log.info("WiFi OK: %s", r.stdout.strip())
         return True
-    log.error("nmcli fallo rc=%s out=%s err=%s", r.returncode, r.stdout.strip(), r.stderr.strip())
+    log.error(
+        "no pude conectar %s (rc=%s) out=%s err=%s",
+        SSID, r.returncode, r.stdout.strip(), r.stderr.strip(),
+    )
     return False
 
 
@@ -758,6 +777,10 @@ def _grant_in_cooldown(state, escalate):
 
 def _try_grant_from_probe(state):
     """Si el probe dice captive, intenta grant. Devuelve True si restauro online."""
+    # La recuperacion puede durar decenas de segundos. Revalidar el SSID en
+    # cada intento: un 204 de otra red NO prueba que Club se haya recuperado.
+    if current_ssid() != SSID:
+        return False
     st, loc = probe()
     if st == "online":
         return True
@@ -892,11 +915,24 @@ def cycle(state):
         # (si hace falta) grant en loop corto, no un solo verify_online.
         deadline = time.time() + 40
         while time.time() < deadline:
+            cur = current_ssid()
+            if cur and cur != SSID:
+                state["fail_streak"] = 0
+                log.warning(
+                    "recuperacion abortada: el WiFi quedo en otra red (%r != %r)",
+                    cur, SSID,
+                )
+                return "other-network"
             if _try_grant_from_probe(state):
                 state["fail_streak"] = 0
-                log.info("internet restaurado tras bounce de WiFi")
+                log.info("internet restaurado tras reconexion de WiFi")
                 return "bounced"
             time.sleep(3)
+    cur = current_ssid()
+    if cur and cur != SSID:
+        state["fail_streak"] = 0
+        log.warning("recuperacion cancelada: el WiFi esta en otra red (%r)", cur)
+        return "other-network"
     return "failed"
 
 

@@ -51,6 +51,10 @@ sesión nueva — y vuelves a tener internet.
    grantea con la IP nueva.
 6. Antes de re-botear el WiFi por `nmcli` (último recurso) vuelve a sondear:
    si el internet ya regresó, no apaga el radio.
+7. Al reconectar primero activa el perfil con `nmcli connection up`, sin apagar
+   el radio. Antes de aceptar el resultado exige que el SSID real sea
+   `Club_Totalplay_WiFi`: un `204` de otra red no cuenta como recuperación y,
+   si cambias de red manualmente, el daemon se abstiene.
 
 Todo en segundo plano, con un **icono en la bandeja** que cambia de color:
 
