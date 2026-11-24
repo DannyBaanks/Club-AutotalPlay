@@ -190,7 +190,7 @@ AP no va cifrado y cualquiera conectado puede intentar hablarle a tu máquina.
 
 El `POST` del portal se liga a **esta** interfaz: la MAC y la IP de los
 parámetros deben ser las locales, y la IP debe caer en la subred de Club
-(`10.149.0.0/16`). Si la identidad local no se puede leer, el grant queda
+(`10.149.0.0/16, 10.229.0.0/16`). Si la identidad local no se puede leer, el grant queda
 `UNVERIFIED` y **no se otorga** (fail-closed): un redirect spoofeado con otra
 MAC/IP no puede hacer que la app pida una sesión para otro equipo.
 
@@ -206,7 +206,7 @@ Variables (opcionales; reinicia el daemon/servicio para que tome el entorno):
 
 | Variable | Default | Efecto |
 |---|---|---|
-| `CLUB_ALLOWED_SUBNETS` | `10.149.0.0/16` | Subredes donde se acepta el grant (separadas por coma). |
+| `CLUB_ALLOWED_SUBNETS` | `10.149.0.0/16,10.229.0.0/16` | Subredes donde se acepta el grant (separadas por coma). |
 | `CLUB_ALLOWED_OUIS` | `48:4C:29,94:90:10` | OUIs de BSSID consideradas conocidas. |
 | `CLUB_REQUIRE_KNOWN_OUI` | `0` | `1`: no otorga ni recupera si el BSSID es desconocido o ilegible. |
 | `CLUB_ALLOW_UNKNOWN_BSSID` | `0` | `1`: desactiva el filtro de anomalía OUI (no recomendado). |

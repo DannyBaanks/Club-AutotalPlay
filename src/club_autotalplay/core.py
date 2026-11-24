@@ -71,7 +71,9 @@ POLL_EXPIRY_SECONDS = 1    # sondeo dentro de la ventana de expiracion
 # UNVERIFIED y NO se otorga. La OUI del BSSID y el TLS al portal son solo
 # senales de anomalia: no prueban identidad y no desconectan la WiFi.
 ALLOWED_SUBNETS_ENV = "CLUB_ALLOWED_SUBNETS"
-DEFAULT_ALLOWED_SUBNETS = "10.149.0.0/16"
+# 10.229/16: AP Club real (BSSID 48:4c:29:2b:3e:5f) dio DHCP 10.229.28.130
+# el 2026-11-24 16:21; sin ese rango el binding bloqueaba un grant legitimo.
+DEFAULT_ALLOWED_SUBNETS = "10.149.0.0/16,10.229.0.0/16"
 ALLOWED_OUIS_ENV = "CLUB_ALLOWED_OUIS"
 DEFAULT_ALLOWED_OUIS = "48:4C:29,94:90:10"  # Huawei TotalPlay; 96:90:10 = LAA de 94:90:10
 REQUIRE_KNOWN_OUI_ENV = "CLUB_REQUIRE_KNOWN_OUI"

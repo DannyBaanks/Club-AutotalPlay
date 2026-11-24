@@ -60,6 +60,12 @@ def test_binding_subred_ajena(monkeypatch):
     assert core.check_params_binding(_params(ip="192.168.1.10")) == core.BIND_MISMATCH
 
 
+def test_binding_subred_10_229_observada(monkeypatch):
+    # 2026-11-24 16:21: AP Club real (48:4c:29:2b:3e:5f) dio 10.229.28.130.
+    _ident(monkeypatch, "10.229.28.130", IDENT_MAC)
+    assert core.check_params_binding(_params(ip="10.229.28.130")) == core.BIND_OK
+
+
 def test_binding_subred_configurable(monkeypatch):
     monkeypatch.setenv(core.ALLOWED_SUBNETS_ENV, "10.150.0.0/16")
     _ident(monkeypatch, "10.150.1.5", IDENT_MAC)
