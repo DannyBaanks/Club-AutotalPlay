@@ -35,3 +35,26 @@ def _rutas_aisladas(tmp_path, monkeypatch):
         if h not in previos:
             logger.removeHandler(h)
             h.close()
+
+
+@pytest.fixture(autouse=True)
+def _identidad_de_prueba(monkeypatch):
+    """Identidad local fija y red neutra para toda la suite.
+
+    El binding del grant se prueba de verdad: estos valores coinciden con
+    CAPTIVE_LOC/PORTAL_PARAMS. Los tests de seguridad sobreescriben
+    `_local_identity`/`current_bssid` cuando necesitan otro escenario.
+    """
+    monkeypatch.setattr(core, "DEV", None)
+    monkeypatch.setattr(
+        core, "_local_identity", lambda: ("10.149.222.166", "50:2e:91:a1:f8:e4")
+    )
+    monkeypatch.setattr(core, "current_bssid", lambda: None)
+    monkeypatch.setattr(core, "_tls_probe", lambda: True)
+    for name in (
+        core.REQUIRE_KNOWN_OUI_ENV,
+        core.ALLOWED_OUIS_ENV,
+        core.ALLOWED_SUBNETS_ENV,
+        "CLUB_ALLOW_UNKNOWN_BSSID",
+    ):
+        monkeypatch.delenv(name, raising=False)

@@ -65,6 +65,18 @@ EXPIRY_LEAD_SECONDS = 20   # abrir la ventana de sondeo rapido este tanto antes
 EXPIRY_TAIL_SECONDS = 60   # ...y mantenerla este tanto despues
 POLL_EXPIRY_SECONDS = 1    # sondeo dentro de la ventana de expiracion
 
+# --- Endurecimiento del grant (2026-11-24) --------------------------------
+# El probe viaja por HTTP plano y un AP gemelo puede falsificar el 204/302.
+# El grant se liga a la interfaz (MAC+IP+subred); identidad ilegible =>
+# UNVERIFIED y NO se otorga. La OUI del BSSID y el TLS al portal son solo
+# senales de anomalia: no prueban identidad y no desconectan la WiFi.
+ALLOWED_SUBNETS_ENV = "CLUB_ALLOWED_SUBNETS"
+DEFAULT_ALLOWED_SUBNETS = "10.149.0.0/16"
+ALLOWED_OUIS_ENV = "CLUB_ALLOWED_OUIS"
+DEFAULT_ALLOWED_OUIS = "48:4C:29,94:90:10"  # Huawei TotalPlay; 96:90:10 = LAA de 94:90:10
+REQUIRE_KNOWN_OUI_ENV = "CLUB_REQUIRE_KNOWN_OUI"
+TLS_CHECK_SECONDS = 300    # cada cuanto se cruza el 204 con TLS al portal
+
 if IS_WINDOWS:
     _base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     STATE_DIR = os.path.join(_base, "club-autotalplay")
@@ -297,7 +309,18 @@ def grant_session(params, retries=3):
     al portal ANTES de recurrir al bounce del radio (lo que "apaga el wifi"
     y tarda varios segundos). Cuando el grant falla pero el probe ya da 204,
     cuenta como exito sin bounce.
+
+    Antes de postear, los params deben estar ligados a ESTA interfaz
+    (check_params_binding). Si la identidad local no se puede leer, el grant
+    queda UNVERIFIED y no se manda nada: fail-closed.
     """
+    estado = check_params_binding(params)
+    if estado != BIND_OK:
+        log.error(
+            "grant bloqueado (%s): params no ligados a esta interfaz %s",
+            estado, _redact_params(params),
+        )
+        return False
     for intento in range(retries + 1):
         res = _grant_session_once(params)
         if res is True:
@@ -321,6 +344,9 @@ def grant_session(params, retries=3):
             # el llamador cachea estos params para el proximo grant sin bounce.
             params.clear()
             params.update(fresh)
+            if check_params_binding(params) != BIND_OK:
+                log.error("params frescos no ligados a esta interfaz; no reintento")
+                return False
             continue
         if verify_online(deadline=GRANT_RECHECK_SECONDS, interval=0.5):
             log.info("grant sin respuesta pero el probe ya da 204: sesion otorgada")
@@ -566,6 +592,298 @@ def current_ssid():
         return None
 
 
+# --- Binding del grant a la interfaz + senales de anomalia -----------------
+#
+# Que protege cada cosa:
+#   * binding (MAC+IP+subred): el grant solo se manda si los params son de
+#     ESTA interfaz. Un 302 spoofeado con otra MAC/IP se rechaza. Si la
+#     identidad local no se puede leer, el grant queda UNVERIFIED y no se
+#     otorga (fail-closed).
+#   * OUI del BSSID: filtro de anomalia. NO prueba que el AP sea autentico
+#     (la MAC se falsifica); por defecto solo registra/alerta y nunca
+#     desconecta, para no pelear con NetworkManager. Con
+#     CLUB_REQUIRE_KNOWN_OUI=1 pasa a ser compuerta del grant.
+#   * TLS al portal: segundo chequeo tras un 204. Un AP que retransmite deja
+#     pasar TLS, asi que tampoco prueba identidad; detecta portales falsos y
+#     redes que bloquean TLS.
+# La autenticidad del enlace WiFi abierto no se puede demostrar en L2: para
+# el plano de datos hace falta VPN (o 802.1X/PMF, que este hotspot no ofrece).
+
+_BSSID_RE = re.compile(r"\b([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})\b")
+
+BIND_OK = "ok"
+BIND_MISMATCH = "mismatch"
+BIND_UNVERIFIED = "unverified"
+
+
+def _env_bool(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _norm_mac(mac):
+    return (mac or "").replace("-", ":").strip().lower()
+
+
+def _oui_candidates(mac):
+    """OUIs posibles de una MAC, incluida la variante sin bit LAA.
+
+    Un CPE Huawei puede reportar 96:90:10 (bit locally-administered puesto)
+    cuando su OUI de fabricante es 94:90:10. Se aceptan ambas.
+    """
+    parts = _norm_mac(mac).split(":")
+    if len(parts) != 6:
+        return set()
+    try:
+        first = int(parts[0], 16)
+    except ValueError:
+        return set()
+    return {
+        ":".join(parts[:3]).upper(),
+        f"{first & 0xFD:02X}:{parts[1].upper()}:{parts[2].upper()}",
+    }
+
+
+def _allowed_ouis():
+    raw = os.environ.get(ALLOWED_OUIS_ENV, DEFAULT_ALLOWED_OUIS)
+    return {o.strip().upper() for o in raw.split(",") if o.strip()}
+
+
+def _oui_allowed(mac):
+    """Filtro de anomalia, no prueba de identidad: una MAC se falsifica."""
+    if _env_bool("CLUB_ALLOW_UNKNOWN_BSSID", False):
+        return True
+    return bool(_oui_candidates(mac) & _allowed_ouis())
+
+
+def _require_known_oui():
+    return _env_bool(REQUIRE_KNOWN_OUI_ENV, False)
+
+
+def _allowed_subnets():
+    raw = os.environ.get(ALLOWED_SUBNETS_ENV, DEFAULT_ALLOWED_SUBNETS)
+    nets = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(part, strict=False))
+        except ValueError:
+            log.warning("subred ignorada en %s: %r", ALLOWED_SUBNETS_ENV, part)
+    return nets
+
+
+def _ip_allowed(ip):
+    try:
+        addr = ipaddress.ip_address(ip)
+    except (ValueError, TypeError):
+        return False
+    return any(addr in net for net in _allowed_subnets())
+
+
+def current_bssid():
+    """BSSID asociado, o None si no se puede leer (fail-open del filtro)."""
+    if IS_WINDOWS:
+        out = _windows_wlan_show()
+        if not out:
+            return None
+        for line in out.splitlines():
+            s = line.strip()
+            if s.lower().startswith("bssid"):
+                m = _BSSID_RE.search(s)
+                return m.group(1).lower() if m else None
+        return None
+    dev = wifi_device()
+    if not dev:
+        return None
+    try:
+        r = _run(["iw", "dev", dev, "link"], timeout=5)
+        if r.returncode == 0:
+            m = _BSSID_RE.search(r.stdout or "")
+            if m:
+                return m.group(1).lower()
+    except Exception as e:
+        log.debug("iw link fallo: %s", e)
+    try:
+        out = _run(
+            ["nmcli", "-t", "-f", "IN-USE,BSSID", "dev", "wifi", "list"], timeout=10
+        ).stdout
+        for line in out.splitlines():
+            if line.startswith("*"):
+                m = _BSSID_RE.search(line.replace("\\:", ":"))
+                if m:
+                    return m.group(1).lower()
+    except Exception as e:
+        log.debug("nmcli BSSID fallo: %s", e)
+    return None
+
+
+def _windows_local_identity():
+    """(IP, MAC) en Windows; (None, None) si no se pueden parsear."""
+    ip = mac = None
+    out = _windows_wlan_show()
+    if out:
+        for line in out.splitlines():
+            s = line.strip()
+            if s.lower().startswith("bssid"):
+                continue
+            m = _BSSID_RE.search(s)
+            if m:
+                mac = m.group(1).lower()
+                break
+    try:
+        r = _run(["ipconfig"], timeout=10)
+        for line in (r.stdout or "").splitlines():
+            if "IPv4" in line:
+                m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", line)
+                if m:
+                    ip = m.group(1)
+                    break
+    except Exception as e:
+        log.debug("no pude leer IP local (Windows): %s", e)
+    return ip, mac
+
+
+def _local_identity():
+    """(IPv4, MAC) de la interfaz WiFi, o (None, None) si no se pueden leer.
+
+    Que devuelva None no autoriza el grant: `check_params_binding` lo trata
+    como UNVERIFIED y el llamador falla cerrado.
+    """
+    if IS_WINDOWS:
+        return _windows_local_identity()
+    dev = wifi_device()
+    if not dev:
+        return None, None
+    ip = None
+    mac = None
+    try:
+        r = _run(["nmcli", "-g", "IP4.ADDRESS", "dev", "show", dev], timeout=5)
+        for line in (r.stdout or "").splitlines():
+            line = line.strip()
+            if line:
+                ip = line.split("/", 1)[0].strip()
+                break
+    except Exception as e:
+        log.debug("no pude leer IP local: %s", e)
+    try:
+        # -t no escapa los ':' de la MAC; -g los devuelve como '\:'.
+        r = _run(["nmcli", "-t", "-f", "GENERAL.HWADDR", "dev", "show", dev], timeout=5)
+        m = _BSSID_RE.search((r.stdout or "").replace("\\:", ":"))
+        if m:
+            mac = m.group(1).lower()
+    except Exception as e:
+        log.debug("no pude leer MAC local: %s", e)
+    return ip, mac
+
+
+def check_params_binding(params):
+    """ok | mismatch | unverified para los params del portal.
+
+    Requiere MAC local e IP local. Ademas la IP debe caer en una subred Club
+    permitida. Si la identidad local no se puede leer, UNVERIFIED: el grant
+    NO se otorga.
+    """
+    if not params:
+        return BIND_MISMATCH
+    ip = params.get("ip")
+    mac = params.get("mac")
+    if not (ip and mac):
+        return BIND_MISMATCH
+    if not _ip_allowed(ip):
+        log.warning("params ip=%s fuera de las subredes Club permitidas", _redact_ip(ip))
+        return BIND_MISMATCH
+    local_ip, local_mac = _local_identity()
+    if not local_mac:
+        log.warning("no pude verificar la MAC local; grant UNVERIFIED")
+        return BIND_UNVERIFIED
+    if _norm_mac(mac) != _norm_mac(local_mac):
+        log.warning(
+            "params mac=%s no es la MAC local=%s",
+            _redact_mac(mac), _redact_mac(local_mac),
+        )
+        return BIND_MISMATCH
+    if not local_ip:
+        log.warning("no pude verificar la IP local; grant UNVERIFIED")
+        return BIND_UNVERIFIED
+    if ip != local_ip:
+        log.warning("params ip=%s no es la IP local=%s", _redact_ip(ip), _redact_ip(local_ip))
+        return BIND_MISMATCH
+    return BIND_OK
+
+
+def _tls_probe():
+    """Handshake TLS real contra el portal. True si el certificado valida.
+
+    Un AP que retransmite deja pasar TLS: esto no prueba que el AP sea
+    legitimo. Detecta un portal falso que forja el 204 y no termina TLS
+    contra el host real, o una red que bloquea TLS.
+    """
+    ctx = ssl.create_default_context()
+    try:
+        conn = http.client.HTTPSConnection(GRANT_HOST, 443, timeout=TIMEOUT, context=ctx)
+        conn.request("HEAD", "/", headers={"User-Agent": USER_AGENT})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        return True
+    except ssl.SSLError as e:
+        log.warning("TLS a %s fallo (certificado): %s", GRANT_HOST, e)
+        return False
+    except Exception as e:
+        log.warning("TLS a %s fallo: %s", GRANT_HOST, e)
+        return False
+
+
+def _maybe_tls_check(state):
+    """Cruza el 204 con TLS cada TLS_CHECK_SECONDS; solo registra la senal."""
+    sec = state.setdefault("security", {})
+    last = sec.get("tls_checked", "")
+    if last and (time.time() - _iso_to_epoch(last)) < TLS_CHECK_SECONDS:
+        return True
+    sec["tls_checked"] = now_iso()
+    ok = _tls_probe()
+    if ok:
+        sec.pop("tls_unverified", None)
+    else:
+        sec["tls_unverified"] = now_iso()
+        log.warning(
+            "probe=online pero TLS al portal fallo: posible 204 falsificado "
+            "o red que bloquea TLS (senal, no prueba de AP falso)"
+        )
+    save_state(state)
+    return ok
+
+
+def _note_untrusted_bssid(state, bssid):
+    """Registra un BSSID fuera de la allowlist; no desconecta ni bloquea."""
+    sec = state.setdefault("security", {})
+    sec["bssid"] = bssid
+    if sec.get("untrusted_bssid") != bssid:
+        log.warning(
+            "BSSID %s (OUI %s) fuera de la allowlist %s: senal de anomalia, "
+            "no prueba de AP falso",
+            bssid,
+            ":".join(bssid.split(":")[:3]).upper(),
+            sorted(_allowed_ouis()),
+        )
+        sec["untrusted_bssid"] = bssid
+        sec["untrusted_at"] = now_iso()
+        save_state(state)
+    state["fail_streak"] = 0
+
+
+def _note_trusted_bssid(state, bssid):
+    sec = state.setdefault("security", {})
+    sec["bssid"] = bssid
+    if sec.pop("untrusted_bssid", None) is not None:
+        sec.pop("untrusted_at", None)
+        save_state(state)
+
+
 def interlock_enabled():
     """True salvo que CLUB_AUTOTALPLAY_INTERLOCK=0 (kill-switch)."""
     return os.environ.get(INTERLOCK_ENV, "1") != "0"
@@ -725,6 +1043,13 @@ def handle_captive(location, state):
     if not params:
         log.error("no pude parsear params del portal; location=%s", _redact_location(location))
         return False
+    estado = check_params_binding(params)
+    if estado != BIND_OK:
+        log.error(
+            "params del portal no ligados a esta interfaz (%s); no otorgo: %s",
+            estado, _redact_params(params),
+        )
+        return False
     log.info("captive portal detectado -> otorgando sesion: %s", _redact_params(params))
     res = grant_session(params)
     if not res:
@@ -786,7 +1111,12 @@ def _try_grant_from_probe(state):
         return True
     if st == "captive":
         p = parse_portal_params(loc)
-        if p and grant_session(p) and verify_online(deadline=20):
+        if (
+            p
+            and check_params_binding(p) == BIND_OK
+            and grant_session(p)
+            and verify_online(deadline=20)
+        ):
             state["last_grant_ok"] = now_iso()
             state["last_portal_params"] = p  # cache p/ grant sin bounce
             log.info("SESION OTORGADA")
@@ -798,7 +1128,35 @@ def cycle(state):
     """Un ciclo completo del watchdog. Devuelve accion tomada."""
     cycle_started_attempt = state.get("last_grant_attempt", "")
     st, location = probe()
+
+    # BSSID: filtro de anomalia, NO autenticacion. Se evalua en TODOS los
+    # estados (tambien online): un AP gemelo puede dar internet sin portal.
+    # Por defecto solo registra la senal y NUNCA desconecta (el enlace lo
+    # decide NetworkManager); CLUB_REQUIRE_KNOWN_OUI=1 lo vuelve compuerta.
+    cur = current_ssid()
+    if cur == SSID:
+        bssid = current_bssid()
+        if bssid and _oui_allowed(bssid):
+            _note_trusted_bssid(state, bssid)
+        elif bssid:
+            _note_untrusted_bssid(state, bssid)
+            if _require_known_oui():
+                log.warning(
+                    "BSSID no permitido y %s=1: no otorgo ni recupero",
+                    REQUIRE_KNOWN_OUI_ENV,
+                )
+                return "untrusted-bssid"
+        elif _require_known_oui():
+            # Compuerta explicita: si no se puede leer el BSSID, no se asume
+            # que sea seguro. Por defecto (sin la variable) es solo una senal.
+            log.warning(
+                "BSSID ilegible y %s=1: no otorgo ni recupero",
+                REQUIRE_KNOWN_OUI_ENV,
+            )
+            return "bssid-unverified"
+
     if st == "online":
+        _maybe_tls_check(state)
         state["fail_streak"] = 0
         return "online"
 
@@ -806,7 +1164,7 @@ def cycle(state):
     # (oficina/casa), no ejecutamos NINGUNA recuperacion — el captive seria
     # de otro portal (grant equivocado) y el bounce mataria su conexion.
     # bring_up_wifi repite el guard como defensa en profundidad.
-    cur = current_ssid()
+    # `cur` ya se consulto arriba para el chequeo de BSSID.
     if cur is None:
         state["fail_streak"] = 0
         log.warning(
@@ -847,6 +1205,15 @@ def cycle(state):
         # pierden (el camino "down" los usara despues sin bounce).
         parsed = parse_portal_params(location)
         if parsed:
+            bind = check_params_binding(parsed)
+            if bind != BIND_OK:
+                state["fail_streak"] = 0
+                log.error(
+                    "params del portal no ligados a esta interfaz (%s); "
+                    "no grant ni bounce",
+                    bind,
+                )
+                return f"binding-{bind}"
             state["last_portal_params"] = parsed
         last = state.get("last_grant_attempt", "")
         can_grant = not _grant_in_cooldown(state, escalate)
@@ -873,19 +1240,32 @@ def cycle(state):
         last = state.get("last_grant_attempt", "")
         can_grant = not _grant_in_cooldown(state, escalate)
         if cached and can_grant:
-            state["last_grant_attempt"] = now_iso()
-            save_state(state)
-            res = grant_session(cached)
-            if res == RECOVERED:
+            bind = check_params_binding(cached)
+            if bind == BIND_UNVERIFIED:
                 state["fail_streak"] = 0
-                return "recovered"
-            if res and verify_online(deadline=15):
-                state["last_grant_ok"] = now_iso()
-                state["last_portal_params"] = cached
-                state["fail_streak"] = 0
-                log.info("SESION OTORGADA (params cacheados; radio intacto)")
-                return "granted-cached"
-            # grant fallo (portal inalcanzable?) -> cae al bounce
+                log.error(
+                    "identidad local no verificable; no grant cacheado ni bounce"
+                )
+                return "binding-unverified"
+            if bind != BIND_OK:
+                log.warning(
+                    "params cacheados no ligan a esta interfaz (%s); cae al bounce",
+                    bind,
+                )
+            else:
+                state["last_grant_attempt"] = now_iso()
+                save_state(state)
+                res = grant_session(cached)
+                if res == RECOVERED:
+                    state["fail_streak"] = 0
+                    return "recovered"
+                if res and verify_online(deadline=15):
+                    state["last_grant_ok"] = now_iso()
+                    state["last_portal_params"] = cached
+                    state["fail_streak"] = 0
+                    log.info("SESION OTORGADA (params cacheados; radio intacto)")
+                    return "granted-cached"
+                # grant fallo (portal inalcanzable?) -> cae al bounce
         elif not cached:
             log.info("sin params cacheados del portal; cae al bounce")
 

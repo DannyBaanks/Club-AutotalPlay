@@ -529,6 +529,20 @@ AP no va cifrado y cualquiera conectado puede intentar hablarle a tu máquina.
 - **Nunca toca otra red.** Si estás en otro WiFi, o no se puede saber en cuál,
   no hace nada.
 
+### Qué queda protegido y qué no (2026-11-24)
+
+El grant se liga a la interfaz local (MAC + IP + subred `10.149.0.0/16`). Si
+la identidad no se puede leer, queda `UNVERIFIED` y no se otorga. La OUI del
+BSSID y el TLS al portal son señales de anomalía, no autenticación: una MAC
+se falsifica y un AP que retransmite deja pasar TLS. No se desconecta la WiFi
+automáticamente; las señales quedan en `state.json` (`security.*`) y en el
+log. Para el plano de datos en una red abierta hace falta VPN (802.1X/PMF no
+está disponible en este hotspot).
+
+Variables opcionales: `CLUB_ALLOWED_SUBNETS` (`10.149.0.0/16`),
+`CLUB_ALLOWED_OUIS` (`48:4C:29,94:90:10`), `CLUB_REQUIRE_KNOWN_OUI` (`0`) y
+`CLUB_ALLOW_UNKNOWN_BSSID` (`0`). Detalle en `GUIA.md`.
+
 ### Protege tu equipo: firewall
 
 > [!IMPORTANT]

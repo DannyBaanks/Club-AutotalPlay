@@ -1139,8 +1139,10 @@ def test_grant_sin_dns_reintenta_con_params_frescos(monkeypatch):
 
     monkeypatch.setattr(core, "_grant_session_once", once)
     monkeypatch.setattr(core, "_wait_link", lambda d: ("captive", CAPTIVE_LOC))
-    assert core.grant_session({"ip": "viejo"}) is True
+    viejo = dict(PORTAL_PARAMS, nombreAcc="VIEJO")
+    assert core.grant_session(viejo) is True
     assert seen[1] == core.parse_portal_params(CAPTIVE_LOC)
+    assert seen[1]["nombreAcc"] == "NEZA-TEST"  # el dict del llamador se actualizo
 
 
 def test_reprobe_online_evita_bounce(monkeypatch):
@@ -1246,7 +1248,7 @@ def test_grant_sin_dns_actualiza_params_del_llamador(monkeypatch):
 
     monkeypatch.setattr(core, "_grant_session_once", once)
     monkeypatch.setattr(core, "_wait_link", lambda d: ("captive", CAPTIVE_LOC))
-    params = {"ip": "viejo", "mac": "x", "nombreAcc": "y", "tipo": "DESKTOP"}
+    params = dict(PORTAL_PARAMS, nombreAcc="VIEJO")
     assert core.grant_session(params) is True
     assert params == core.parse_portal_params(CAPTIVE_LOC)
 

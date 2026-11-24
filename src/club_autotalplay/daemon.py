@@ -173,6 +173,14 @@ def _cycle_lock(timeout=LOCK_TIMEOUT):
 _ONLINE_ACTIONS = ("online", "recovered", "granted", "granted-cached", "granted-after-bounce", "bounced")
 # Acciones que restauraron una sesion (no "online" a secas).
 _RESTORED_ACTIONS = ("granted", "granted-cached", "granted-after-bounce", "bounced")
+# Retencion de seguridad: no se otorga ni se toca la red. El poll de "caida"
+# (5 s) repetiria el chequeo y el log; se capa al poll normal.
+_HOLD_ACTIONS = (
+    "untrusted-bssid",
+    "bssid-unverified",
+    "binding-unverified",
+    "binding-mismatch",
+)
 
 
 def _refresh_state(state, action):
@@ -266,6 +274,8 @@ def run(poll=None):
             # Poll adaptativo: rapido (5s) con la red caida, 1s en la ventana
             # de expiracion de la sesion, largo (20s) el resto del tiempo.
             poll_eff = core.next_poll_seconds(state, action in _ONLINE_ACTIONS)
+            if action in _HOLD_ACTIONS:
+                poll_eff = max(poll_eff, core.POLL_SECONDS)
             # duerme en cortos para reaccionar rapido a la senal de parada
             slept = 0.0
             while slept < poll_eff and not stopping["flag"]:
