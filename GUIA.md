@@ -152,7 +152,10 @@ POST https://clubwifi.totalplay.com.mx/ClubMovil/video-completado
    el portal corta la sesión).
 2. Si responde `302` (hubo corte), parsea IP / MAC / `accname` del `Location`.
 3. Manda el `POST` → `204` = sesión otorgada.
-4. Si no basta, re-botea el WiFi (`nmcli` en Linux, `netsh` en Windows).
+4. Si no basta, activa el perfil (`nmcli connection up` en Linux) sin apagar
+   el radio; el re-boteo del radio queda como último recurso. En Windows usa
+   `netsh`. Solo acepta la recuperación si el SSID real sigue siendo
+   `Club_Totalplay_WiFi`; si cambias a otra red, no insiste.
 
 > **Aviso:** el `204` prueba que el servidor acepta la solicitud; no prueba que
 > automatizarlo de forma indefinida esté permitido por los Términos de
@@ -182,6 +185,34 @@ AP no va cifrado y cualquiera conectado puede intentar hablarle a tu máquina.
   `state.json` `0600` (Linux). Logs y `status` enmascaran IP, MAC y zona.
 - **Nunca toca otra red.** Si estás en otro WiFi, o no se puede saber en cuál,
   no hace nada.
+
+### Qué queda protegido y qué no (2026-11-24)
+
+El `POST` del portal se liga a **esta** interfaz: la MAC y la IP de los
+parámetros deben ser las locales, y la IP debe caer en la subred de Club
+(`10.149.0.0/16, 10.229.0.0/16`). Si la identidad local no se puede leer, el grant queda
+`UNVERIFIED` y **no se otorga** (fail-closed): un redirect spoofeado con otra
+MAC/IP no puede hacer que la app pida una sesión para otro equipo.
+
+La OUI del BSSID y el TLS al portal son **señales de anomalía, no pruebas de
+identidad**: una MAC se falsifica y un AP que retransmite deja pasar TLS. Por
+eso no se desconecta automáticamente (sería pelear con NetworkManager); se
+registran en `state.json` (`security.untrusted_bssid`,
+`security.tls_unverified`) y en el log. La autenticidad del enlace WiFi
+abierto no se puede demostrar en L2: para el plano de datos usa VPN (o
+802.1X/PMF, que este hotspot no ofrece).
+
+Variables (opcionales; reinicia el daemon/servicio para que tome el entorno):
+
+| Variable | Default | Efecto |
+|---|---|---|
+| `CLUB_ALLOWED_SUBNETS` | `10.149.0.0/16,10.229.0.0/16` | Subredes donde se acepta el grant (separadas por coma). |
+| `CLUB_ALLOWED_OUIS` | `48:4C:29,94:90:10` | OUIs de BSSID consideradas conocidas. |
+| `CLUB_REQUIRE_KNOWN_OUI` | `0` | `1`: no otorga ni recupera si el BSSID es desconocido o ilegible. |
+| `CLUB_ALLOW_UNKNOWN_BSSID` | `0` | `1`: desactiva el filtro de anomalía OUI (no recomendado). |
+
+Si TotalPlay cambia de rango o de fabricante en otra zona, ajusta las dos
+primeras variables.
 
 ### Protege tu equipo: firewall
 

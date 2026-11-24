@@ -244,8 +244,8 @@ def test_bring_up_wifi_no_toca_otra_red(monkeypatch):
     assert core.bring_up_wifi() is False
 
 
-def test_bring_up_wifi_si_red_propia(monkeypatch):
-    """Con nuestra red (o sin red), el bounce sí se ejecuta."""
+def test_bring_up_wifi_si_red_propia_prefiere_connection_up(monkeypatch):
+    """Con nuestra red, activa el perfil sin apagar todo el radio."""
     monkeypatch.setattr(core, "IS_WINDOWS", False)
     monkeypatch.setattr(core, "current_ssid", lambda: core.SSID)
     monkeypatch.setattr(core, "wifi_connected", lambda: True)
@@ -259,13 +259,15 @@ def test_bring_up_wifi_si_red_propia(monkeypatch):
     monkeypatch.setattr(core, "_run", fake_run)
     monkeypatch.setattr(core.time, "sleep", lambda s: None)
     assert core.bring_up_wifi() is True
-    assert ["nmcli", "radio", "wifi", "off"] in runs
+    assert ["nmcli", "connection", "up", core.SSID] in runs
+    assert ["nmcli", "radio", "wifi", "off"] not in runs
 
 
 def test_bring_up_wifi_sin_red(monkeypatch):
-    """Sin WiFi conectado, también puede rebotar (no hay red ajena que matar)."""
+    """Sin WiFi conectado, activa Club y exige que ese sea el SSID final."""
     monkeypatch.setattr(core, "IS_WINDOWS", False)
-    monkeypatch.setattr(core, "current_ssid", lambda: "")
+    ssids = iter(["", core.SSID])
+    monkeypatch.setattr(core, "current_ssid", lambda: next(ssids, core.SSID))
     monkeypatch.setattr(core, "wifi_connected", lambda: True)
     runs = []
 
@@ -277,6 +279,155 @@ def test_bring_up_wifi_sin_red(monkeypatch):
     monkeypatch.setattr(core, "_run", fake_run)
     monkeypatch.setattr(core.time, "sleep", lambda s: None)
     assert core.bring_up_wifi() is True
+    assert ["nmcli", "connection", "up", core.SSID] in runs
+    assert ["nmcli", "radio", "wifi", "off"] not in runs
+
+
+# ---------------------------------------------------------------------------
+# interlock con wifihost: con hotspot activo el radio no se apaga primero
+# ---------------------------------------------------------------------------
+
+def _run_ok_factory(runs):
+    def fake_run(cmd, timeout=15):
+        runs.append(cmd)
+        class R:
+            returncode, stdout, stderr = 0, "ok", ""
+        return R()
+    return fake_run
+
+
+def _hotspot_state(tmp_path, monkeypatch, content="SCENARIO=B\nAP_IF=ap0\nUP=wlo1\n"):
+    st = tmp_path / "wifihost" / "state"
+    st.parent.mkdir(parents=True)
+    st.write_text(content)
+    monkeypatch.setattr(core, "HOTSPOT_STATE_PATH", str(st))
+    return st
+
+
+def test_hotspot_active_lee_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "HOTSPOT_STATE_PATH", str(tmp_path / "state"))
+    assert core.hotspot_active() is False
+    (tmp_path / "state").write_text("SCENARIO=B\nAP_IF=ap0\n")
+    assert core.hotspot_active() is True
+    (tmp_path / "state").write_text("SCENARIO=A\n")   # sin AP propio
+    assert core.hotspot_active() is False
+
+
+def test_interlock_activo_no_apaga_radio(monkeypatch, tmp_path):
+    """Con hotspot activo e interlock on: connection up, nunca radio off."""
+    monkeypatch.setattr(core, "IS_WINDOWS", False)
+    monkeypatch.setattr(core, "current_ssid", lambda: core.SSID)
+    monkeypatch.setattr(core, "wifi_connected", lambda: True)
+    _hotspot_state(tmp_path, monkeypatch)
+    monkeypatch.delenv(core.INTERLOCK_ENV, raising=False)  # default: activo
+    runs = []
+    monkeypatch.setattr(core, "_run", _run_ok_factory(runs))
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+
+    assert core.bring_up_wifi() is True
+    assert ["nmcli", "connection", "up", core.SSID] in runs
+    assert ["nmcli", "radio", "wifi", "off"] not in runs
+
+
+def test_interlock_kill_switch_usa_radio(monkeypatch, tmp_path):
+    """CLUB_AUTOTALPLAY_INTERLOCK=0 restaura el comportamiento historico."""
+    monkeypatch.setattr(core, "IS_WINDOWS", False)
+    monkeypatch.setattr(core, "current_ssid", lambda: core.SSID)
+    monkeypatch.setattr(core, "wifi_connected", lambda: True)
+    _hotspot_state(tmp_path, monkeypatch)
+    monkeypatch.setenv(core.INTERLOCK_ENV, "0")
+    runs = []
+    monkeypatch.setattr(core, "_run", _run_ok_factory(runs))
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+
+    assert core.bring_up_wifi() is True
+    assert ["nmcli", "radio", "wifi", "off"] in runs
+
+
+def test_sin_hotspot_tambien_prefiere_connection_up(monkeypatch, tmp_path):
+    """Sin hotspot tambien se evita el rfkill y sus auto-conexiones ajenas."""
+    monkeypatch.setattr(core, "IS_WINDOWS", False)
+    monkeypatch.setattr(core, "current_ssid", lambda: core.SSID)
+    monkeypatch.setattr(core, "wifi_connected", lambda: True)
+    monkeypatch.setattr(core, "HOTSPOT_STATE_PATH", str(tmp_path / "no-existe"))
+    monkeypatch.delenv(core.INTERLOCK_ENV, raising=False)
+    runs = []
+    monkeypatch.setattr(core, "_run", _run_ok_factory(runs))
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+
+    assert core.bring_up_wifi() is True
+    assert ["nmcli", "connection", "up", core.SSID] in runs
+    assert ["nmcli", "radio", "wifi", "off"] not in runs
+
+
+def test_interlock_fallback_a_radio_si_connection_up_falla(monkeypatch, tmp_path):
+    """Si la via suave falla, cae al bounce de radio: nunca sin internet."""
+    monkeypatch.setattr(core, "IS_WINDOWS", False)
+    monkeypatch.setattr(core, "current_ssid", lambda: core.SSID)
+    _hotspot_state(tmp_path, monkeypatch)
+    monkeypatch.delenv(core.INTERLOCK_ENV, raising=False)
+    runs = []
+
+    def fake_run(cmd, timeout=15):
+        runs.append(cmd)
+        class R:
+            pass
+        r = R()
+        r.returncode = 1 if cmd[:2] == ["nmcli", "connection"] else 0
+        r.stdout, r.stderr = "", "falla simulada"
+        return r
+
+    monkeypatch.setattr(core, "_run", fake_run)
+    monkeypatch.setattr(core, "_wait_wifi_connected", lambda deadline: False)
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+
+    assert core.bring_up_wifi() is False
+    assert ["nmcli", "connection", "up", core.SSID] in runs   # suave, primero
+    assert ["nmcli", "radio", "wifi", "off"] in runs          # ultimo recurso
+
+
+def test_bring_up_wifi_respeta_cambio_manual_a_otra_red(monkeypatch):
+    """Si NM cae en otra red durante la espera, no rfkill ni segundo up."""
+    monkeypatch.setattr(core, "IS_WINDOWS", False)
+    ssids = iter(["", "TP-Link_Extender"])
+    monkeypatch.setattr(core, "current_ssid", lambda: next(ssids, "TP-Link_Extender"))
+    monkeypatch.setattr(core, "wifi_connected", lambda: True)
+    runs = []
+    monkeypatch.setattr(core, "_run", _run_ok_factory(runs))
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+
+    assert core.bring_up_wifi() is False
+    assert runs == [["nmcli", "connection", "up", core.SSID]]
+
+
+@pytest.mark.parametrize("bring_result", [True, False])
+def test_ciclo_no_confunde_otra_red_con_bounced(monkeypatch, bring_result):
+    """Un 204 de otra red no puede convertirse en recuperacion de Club."""
+    monkeypatch.setattr(core, "probe", lambda: ("down", None))
+    ssids = iter([core.SSID, "DANNY 9882"])
+    monkeypatch.setattr(core, "current_ssid", lambda: next(ssids, "DANNY 9882"))
+    monkeypatch.setattr(core, "wifi_connected", lambda: True)
+    monkeypatch.setattr(core, "bring_up_wifi", lambda: bring_result)
+    monkeypatch.setattr(core, "save_state", lambda s: None)
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+
+    def forbidden(state):
+        raise AssertionError("no debe sondear/grantear como Club desde otra red")
+
+    monkeypatch.setattr(core, "_try_grant_from_probe", forbidden)
+    state = _fresh_state()
+    assert core.cycle(state) == "other-network"
+    assert state["fail_streak"] == 0
+
+
+def test_try_grant_from_probe_exige_ssid_club(monkeypatch):
+    monkeypatch.setattr(core, "current_ssid", lambda: "TP-Link_Extender")
+
+    def forbidden():
+        raise AssertionError("no debe aceptar el probe de otra red")
+
+    monkeypatch.setattr(core, "probe", forbidden)
+    assert core._try_grant_from_probe(_fresh_state()) is False
 
 
 # ---------------------------------------------------------------------------
@@ -988,8 +1139,10 @@ def test_grant_sin_dns_reintenta_con_params_frescos(monkeypatch):
 
     monkeypatch.setattr(core, "_grant_session_once", once)
     monkeypatch.setattr(core, "_wait_link", lambda d: ("captive", CAPTIVE_LOC))
-    assert core.grant_session({"ip": "viejo"}) is True
+    viejo = dict(PORTAL_PARAMS, nombreAcc="VIEJO")
+    assert core.grant_session(viejo) is True
     assert seen[1] == core.parse_portal_params(CAPTIVE_LOC)
+    assert seen[1]["nombreAcc"] == "NEZA-TEST"  # el dict del llamador se actualizo
 
 
 def test_reprobe_online_evita_bounce(monkeypatch):
@@ -1095,7 +1248,7 @@ def test_grant_sin_dns_actualiza_params_del_llamador(monkeypatch):
 
     monkeypatch.setattr(core, "_grant_session_once", once)
     monkeypatch.setattr(core, "_wait_link", lambda d: ("captive", CAPTIVE_LOC))
-    params = {"ip": "viejo", "mac": "x", "nombreAcc": "y", "tipo": "DESKTOP"}
+    params = dict(PORTAL_PARAMS, nombreAcc="VIEJO")
     assert core.grant_session(params) is True
     assert params == core.parse_portal_params(CAPTIVE_LOC)
 
