@@ -790,9 +790,97 @@ def current_bssid():
     return None
 
 
+# Rangos que NUNCA pueden ser la IP del cliente en el portal cautivo:
+# CGNAT (Tailscale, red de datos del movil, tethering). Antes se tomaba el
+# primer IPv4 de `ipconfig` y con una VPN presente ese era el primer: el
+# binding del grant quedaba "mismatch" y el watchdog ni otorgaba ni
+# reboteaba (log 2026-11-27 15:11..15:15, cada 21 s sin recuperar).
+_NON_PORTAL_NETWORKS = (
+    ipaddress.ip_network("100.64.0.0/10"),   # CGNAT RFC 6598
+    ipaddress.ip_network("169.254.0.0/16"),  # link-local
+    ipaddress.ip_network("127.0.0.0/8"),     # loopback
+)
+
+
+def _is_portal_client_ip(ip):
+    """True si la IP podria ser la que el AP asigno a este cliente."""
+    if not ip:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return not any(addr in net for net in _NON_PORTAL_NETWORKS)
+
+
+def _windows_interfaces():
+    """[(ifIndex, ip, mac, media_type)] de los adaptes con IPv4, via PowerShell.
+
+    Los nombres de propiedad de Get-NetAdapter / Get-NetIPAddress son estables
+    entre idiomas, al reves de las etiquetas de `netsh`/`ipconfig` ("Dirección" /
+    "Nombre" en es-MX, "Address" / "Name" en en-US): parsear por etiqueta NO
+    es portable.
+
+    OJO al parseo: `line.strip()` se come el tab del final y con el la ultima
+    columna, asi que solo se limpian los saltos de linea.
+    """
+    ps = (
+        "Get-NetIPAddress -AddressFamily IPv4 | ForEach-Object { "
+        "$a = Get-NetAdapter -InterfaceIndex $_.InterfaceIndex; "
+        "\"$($_.InterfaceIndex)`t$($_.IPAddress)`t$($a.MacAddress)`t$($a.MediaType)\" }"
+    )
+    try:
+        r = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], timeout=15)
+    except Exception as e:
+        log.debug("no pude listar interfaces (PowerShell): %s", e)
+        return []
+    out = []
+    for line in (r.stdout or "").splitlines():
+        parts = [p.strip() for p in line.rstrip("\r\n").split("\t")]
+        if len(parts) >= 3 and parts[1]:
+            parts += [""] * (4 - len(parts))
+            out.append((parts[0], parts[1], parts[2], parts[3]))
+    return out
+
+
+def _windows_default_if_index():
+    """ifIndex de la interfaz que lleva la ruta por defecto (o None)."""
+    ps = (
+        "Get-NetRoute -DestinationPrefix '0.0.0.0/0' -AddressFamily IPv4 "
+        "| Sort-Object RouteMetric,ifMetric "
+        "| Select-Object -First 1 -ExpandProperty ifIndex"
+    )
+    try:
+        r = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], timeout=15)
+        return (r.stdout or "").strip() or None
+    except Exception as e:
+        log.debug("no pude leer la ruta por defecto: %s", e)
+        return None
+
+
+def _windows_identity_from_ipconfig():
+    """Ultimo recurso: el primer IPv4 de `ipconfig` que no sea CGNAT/link-local."""
+    try:
+        r = _run(["ipconfig"], timeout=10)
+    except Exception as e:
+        log.debug("no pude leer IP local (Windows): %s", e)
+        return None
+    for line in (r.stdout or "").splitlines():
+        if "IPv4" in line:
+            m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", line)
+            if m and _is_portal_client_ip(m.group(1)):
+                return m.group(1)
+    return None
+
+
 def _windows_local_identity():
-    """(IP, MAC) en Windows; (None, None) si no se pueden parsear."""
-    ip = mac = None
+    """(IP, MAC) en Windows; (None, None) si no se pueden parsear.
+
+    La IP se busca DEL ADAPTADOR WiFi, no "la primera IPv4 del sistema": con
+    una VPN (Tailscale) levantada el sistema tiene varias y el portal solo
+    reconoce la que el AP asigno a la interfaz WiFi.
+    """
+    mac = None
     out = _windows_wlan_show()
     if out:
         for line in out.splitlines():
@@ -803,16 +891,42 @@ def _windows_local_identity():
             if m:
                 mac = m.group(1).lower()
                 break
-    try:
-        r = _run(["ipconfig"], timeout=10)
-        for line in (r.stdout or "").splitlines():
-            if "IPv4" in line:
-                m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", line)
-                if m:
-                    ip = m.group(1)
+
+    ip = None
+    interfaces = _windows_interfaces()
+    if interfaces and mac:
+        # 1) la interfaz cuya MAC es la del WiFi: identidad exacta. La MAC la
+        #    da `netsh wlan show interfaces`, que reporta SOLO el adaptador
+        #    WiFi activo (el hotspot virtual de Windows tiene la misma MAC
+        #    pero con el segundo octeto alterado: c6-.. en vez de c4-..).
+        for if_index, cand, cand_mac, _media in interfaces:
+            if cand_mac and _norm_mac(cand_mac) == _norm_mac(mac):
+                ip = cand
+                log.debug("IP local por MAC del WiFi (%s): %s", _redact_mac(mac), _redact_ip(ip))
+                break
+    if ip is None:
+        # 2) la interfaz de la ruta por defecto: es la que usa el probe
+        def_index = _windows_default_if_index()
+        if def_index is not None:
+            for if_index, cand, _cand_mac, _media in interfaces:
+                if if_index == def_index and _is_portal_client_ip(cand):
+                    ip = cand
+                    log.debug("IP local por ruta por defecto (idx=%s): %s", def_index, _redact_ip(ip))
                     break
-    except Exception as e:
-        log.debug("no pude leer IP local (Windows): %s", e)
+    if ip is None and mac:
+        # 3) el unico adaptador WiFi fisico (MediaType estable entre idiomas)
+        wifi = [c for _i, c, _m, media in interfaces if media == "Native 802.11"]
+        if len(wifi) == 1:
+            ip = wifi[0]
+            log.debug("IP local por unico adaptador 802.11: %s", _redact_ip(ip))
+    if ip is None:
+        # 4) ipconfig, saltando CGNAT/link-local/loopback
+        ip = _windows_identity_from_ipconfig()
+        if ip:
+            log.debug("IP local por ipconfig: %s", _redact_ip(ip))
+    if ip is not None and not _is_portal_client_ip(ip):
+        log.debug("IP local descartada (no es IP de cliente del portal): %s", _redact_ip(ip))
+        ip = None
     return ip, mac
 
 

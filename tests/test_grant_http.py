@@ -185,6 +185,64 @@ def test_run_decodifica_utf8():
 
 
 # ---------------------------------------------------------------------------
+# identidad local en Windows: con una VPN (Tailscale) presente
+# ---------------------------------------------------------------------------
+
+def test_ip_local_no_es_la_de_la_vpn(monkeypatch):
+    """Regresion del log 2026-11-27 15:11..15:15.
+
+    Con Tailscale levantado, `ipconfig` lista la VPN antes que el WiFi y el
+    binding quedaba "mismatch": el watchdog ni otorgaba ni reboteaba, y el
+    corte no se recuperaba en ningun ciclo (uno cada 21 s).
+    """
+    monkeypatch.setattr(core, "IS_WINDOWS", True)
+    monkeypatch.setattr(
+        core, "_windows_wlan_show",
+        lambda: "SSID        : Club_Totalplay_WiFi\nDirección   : c4:0f:08:9f:94:08\n",  # noqa: E501
+    )
+    monkeypatch.setattr(core, "_windows_interfaces", lambda: [
+        ("47", "172.31.208.1", "00-15-5D-0B-1D-51", "802.3"),        # WSL
+        ("16", "10.149.223.214", "C4-0F-08-9F-94-08", "Native 802.11"),  # WiFi real
+        ("13", "192.168.137.1", "C6-0F-08-9F-94-08", "Native 802.11"),   # hotspot virtual
+        ("51", "100.120.12.36", "", "IP"),                          # Tailscale
+    ])
+    monkeypatch.setattr(core, "_windows_default_if_index", lambda: "16")
+    monkeypatch.setattr(core, "_windows_identity_from_ipconfig", lambda: "100.120.12.36")
+
+    ip, mac = core._windows_local_identity()
+    assert ip == "10.149.223.214"
+    assert mac == "c4:0f:08:9f:94:08"
+    monkeypatch.setattr(core, "_local_identity", core._windows_local_identity)
+
+    params = {
+        "ip": "10.149.223.214", "mac": "c4-0f-08-9f-94-08",
+        "nombreAcc": "NEZA-TEST", "tipo": "DESKTOP",
+    }
+    assert core.check_params_binding(params) == core.BIND_OK
+
+
+def test_ip_local_descarta_cgnat_aunque_sea_lo_unico_en_ipconfig(monkeypatch):
+    monkeypatch.setattr(core, "IS_WINDOWS", True)
+    monkeypatch.setattr(core, "_windows_wlan_show", lambda: "SSID : Club_Totalplay_WiFi\n")
+    monkeypatch.setattr(core, "_windows_interfaces", lambda: [])
+    monkeypatch.setattr(core, "_windows_default_if_index", lambda: None)
+    monkeypatch.setattr(core, "_windows_identity_from_ipconfig", lambda: "100.120.12.36")
+
+    ip, _mac = core._windows_local_identity()
+    assert ip is None  # fail-closed, no se acepta la VPN como identidad
+
+
+def test_windows_interfaces_no_pierde_la_ultima_columna(monkeypatch):
+    """`line.strip()` se come el tab final y con el la columna vacia."""
+    salida = "47\t172.31.208.1\t00-15-5D-0B-1D-51\t802.3\n16\t10.149.223.214\t\tNative 802.11\n"
+    monkeypatch.setattr(core, "_run", lambda cmd, timeout=15: type("R", (), {"stdout": salida})())
+
+    filas = core._windows_interfaces()
+    assert filas[0] == ("47", "172.31.208.1", "00-15-5D-0B-1D-51", "802.3")
+    assert filas[1] == ("16", "10.149.223.214", "", "Native 802.11")
+
+
+# ---------------------------------------------------------------------------
 # reproduccion del portal real: 204 + chunked sin chunk final
 # ---------------------------------------------------------------------------
 
