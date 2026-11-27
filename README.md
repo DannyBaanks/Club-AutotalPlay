@@ -269,6 +269,51 @@ Todo lo de esta sección se capturó en Ubuntu 24.04 (GNOME, X11) contra la red
 `Club_Totalplay_WiFi`, con el servicio systemd user corriendo el código del
 repo. Los valores de red (IP / MAC / `accname`) van enmascarados.
 
+### El `204` del portal ya no se lee como fallo (2026-11-27)
+
+Análisis de `watchdog.log{,.1,.2,.3}` en Windows (`%LOCALAPPDATA%\club-autotalplay`),
+del 2026-11-23 al 11-27, con el `.exe` de la bandeja del 2026-10-28. Firmas de
+fallo, contadas sobre 1695 líneas `ERROR`/`WARNING`:
+
+| Firma | Veces | Causa |
+|---|---|---|
+| `grant POST fallo: The read operation timed out` | 208 | se leía el cuerpo de un `204` |
+| `grant POST fallo: Remote end closed connection` | 214 | idem (el portal cierra en vez de mandar chunk) |
+| `grant POST fallo: IncompleteRead(0 bytes read)` | 14 | idem |
+| `no pude guardar estado: [WinError 5] Acceso denegado` | 13 | `os.replace` contra un `state.json` abierto |
+
+El portal contesta `204 No Content` **con** `Transfer-Encoding: chunked`, que
+es inválido (un `204` no lleva cuerpo, RFC 9110 §6.4.1). `http.client` entra
+en `_read_chunked()` y espera un chunk que nunca llega: el `POST` **sí había
+otorgado la sesión**, pero el cliente gastaba el timeout y lo reportaba como
+fallo — y el ciclo caía al rebote de radio, que apaga el WiFi que ya
+funcionaba.
+
+Arreglos de este cambio:
+
+1. `_grant_session_once`: el veredicto va por el **status**, y el cuerpo solo
+   se lee cuando el status puede tenerlo (`!= 204/205`). Un cuerpo ilegible
+   ya no convierte un `2xx` en fallo.
+2. `save_state`: el temporal lleva pid+hilo y `os.replace` se reintenta con
+   espera corta (`PermissionError` = otro proceso leyendo `state.json`).
+3. `_run`: decodifica en UTF-8. `text=True` usaba la codificación ANSI y
+   `netsh` emite UTF-8 (medido: `b'Descripci\xc3\xb3n'`), así que el log
+   guardaba `DescripciÃ³n`.
+4. `setup_logging` y el lector del panel: handler y lectura en UTF-8.
+
+Control (mismo servidor local que imita al portal: `204` + `chunked` sin chunk
+final, `GRANT_TIMEOUT=1`):
+
+```
+vieja (read incondicional): ok=False  1000 ms   <- TimeoutError, el bug del log
+nueva (204 sin cuerpo)    : ok=True     31 ms
+```
+
+**NOT_DEMONSTRATED todavía:** cuántos rebotes de radio por día se ahorran en
+la red real — se mide comparando el log de los próximos días con las cifras
+de arriba. El doble `POST` (438 fallos) ya lo había eliminado la autocaptura
+pasiva en `master`; el `.exe` del 2026-10-28 es anterior a ese cambio.
+
 ### v0.2.0: menos bounces de radio (2026-11-04)
 
 Análisis de `watchdog.log` del 2026-10-27 al 11-04. Los grants directos
