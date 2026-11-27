@@ -26,6 +26,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -109,7 +110,12 @@ def setup_logging(level=logging.INFO, to_stdout=True):
     fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s")
     _private_dir(os.path.dirname(LOG_PATH))
     from logging.handlers import RotatingFileHandler
-    fh = RotatingFileHandler(LOG_PATH, maxBytes=512_000, backupCount=3)
+    # encoding explicito: sin el, el handler usa la codificacion ANSI de la
+    # maquina (cp1252 en Windows) y cualquier caracter fuera de ella se
+    # pierde con un UnicodeEncodeError que logging se traga en silencio.
+    fh = RotatingFileHandler(
+        LOG_PATH, maxBytes=512_000, backupCount=3, encoding="utf-8",
+    )
     fh.setFormatter(fmt)
     root.addHandler(fh)
     if to_stdout:
@@ -141,16 +147,34 @@ def now_iso():
 
 def load_state():
     try:
-        with open(STATE_PATH) as f:
+        with open(STATE_PATH, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
 
 
+# Esperas entre reintentos de os.replace (segundos). El primero es 0: el caso
+# normal no duerme nada.
+_STATE_REPLACE_BACKOFF = (0.0, 0.05, 0.1, 0.2, 0.4)
+
+
 def save_state(state):
+    """Escribe state.json de forma atomica, tolerando lectores concurrentes.
+
+    En Windows `os.replace` falla con `WinError 5 (Acceso denegado)` si otro
+    proceso (la bandeja o la GUI, que leen state.json cada 2 s) tiene el
+    archivo abierto justo en ese instante: `open()` no comparte el borrado.
+    Visto 13 veces en los logs 2026-11-23..27. Se reintenta con espera corta
+    en vez de perder el estado del ciclo.
+
+    El temporal lleva pid+hilo: dos escritores (daemon y "Reconectar ahora")
+    no deben pisarse el mismo `.tmp` a medio escribir.
+    """
+    tmp = None
+    ultimo = None
     try:
         _private_dir(os.path.dirname(STATE_PATH))
-        tmp = STATE_PATH + ".tmp"
+        tmp = f"{STATE_PATH}.{os.getpid()}.{threading.get_ident()}.tmp"
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
@@ -161,9 +185,23 @@ def save_state(state):
             json.dump(state, f, indent=2)
         if not IS_WINDOWS:
             os.chmod(tmp, 0o600)
-        os.replace(tmp, STATE_PATH)
+        for espera in _STATE_REPLACE_BACKOFF:
+            if espera:
+                time.sleep(espera)
+            try:
+                os.replace(tmp, STATE_PATH)
+                return
+            except PermissionError as e:
+                ultimo = e
+        log.warning("no pude guardar estado: %s", ultimo)
     except Exception as e:
         log.warning("no pude guardar estado: %s", e)
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -375,6 +413,7 @@ def _grant_session_once(params):
     """True si 2xx; "dns" si no se pudo resolver el host; False en otro fallo."""
     body = json.dumps(params).encode("utf-8")
     ctx = ssl.create_default_context()
+    conn = None
     try:
         conn = http.client.HTTPSConnection(GRANT_HOST, 443, timeout=GRANT_TIMEOUT, context=ctx)
         conn.request(
@@ -389,12 +428,25 @@ def _grant_session_once(params):
             },
         )
         resp = conn.getresponse()
-        data = resp.read()
-        conn.close()
-        ok = 200 <= resp.status < 300
+        status, reason = resp.status, resp.reason
+        ok = 200 <= status < 300
+        # 204/205 NO llevan cuerpo (RFC 9110 §6.4.1). El portal contesta 204
+        # con `Transfer-Encoding: chunked`, que es invalido: http.client entra
+        # en _read_chunked() y se queda esperando un chunk que nunca llega.
+        # Resultado en los logs 2026-11-23..27: 208 "The read operation timed
+        # out" + 214 "Remote end closed" sobre grants que SI habian dado 204
+        # (el POST ya otorgo la sesion). La decision va por el status, no por
+        # el cuerpo; el cuerpo solo se lee cuando existe de verdad.
+        data = b""
+        if status not in (204, 205):
+            try:
+                data = resp.read()
+            except Exception as e:
+                # Un cuerpo ilegible no cambia el veredicto: el status manda.
+                log.warning("grant POST %s con cuerpo ilegible: %s", status, e)
         log.info(
             "grant POST -> HTTP %s %s body=%r params=%s",
-            resp.status, resp.reason, data[:120], _redact_params(params),
+            status, reason, data[:120], _redact_params(params),
         )
         return ok
     except socket.gaierror as e:
@@ -403,6 +455,12 @@ def _grant_session_once(params):
     except Exception as e:
         log.error("grant POST fallo: %s", e)
         return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def _run(cmd, timeout=15):
@@ -411,12 +469,21 @@ def _run(cmd, timeout=15):
     Sin CREATE_NO_WINDOW, cuando el padre es windowed (la bandeja) cada
     `netsh` abre una consola nueva que parpadea en pantalla — y el daemon lo
     llama cada ~20 s, asi que salia una ventana por ciclo.
+
+    Decodificacion UTF-8 explicita: `text=True` a secas usa la codificacion
+    ANSI (cp1252) y `netsh` emite UTF-8. Medido en esta maquina:
+    `netsh wlan show interfaces` devuelve b'Descripci\\xc3\\xb3n', que decodificado
+    como cp1252 queda 'DescripciÃ³n' en el log. `errors="replace"` evita que
+    una salida en otra codificacion tumbe el ciclo con UnicodeDecodeError.
     """
     kwargs = {}
     if IS_WINDOWS:
         # 0x08000000 = CREATE_NO_WINDOW (el hijo no recibe consola)
         kwargs["creationflags"] = 0x08000000
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kwargs)
+    return subprocess.run(
+        cmd, capture_output=True, timeout=timeout,
+        encoding="utf-8", errors="replace", **kwargs,
+    )
 
 
 def _redact_ip(ip):

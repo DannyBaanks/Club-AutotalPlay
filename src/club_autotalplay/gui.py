@@ -44,7 +44,7 @@ def _state_name(state):
 
 def _read_log_tail(n=12):
     try:
-        with open(core.LOG_PATH, "r", errors="replace") as f:
+        with open(core.LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
         return "".join(lines[-n:])
     except Exception as e:
